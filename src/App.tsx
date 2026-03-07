@@ -136,16 +136,24 @@ export default function App() {
     }
   };
 
+  const carouselNews = news.slice(0, 5);
+
+  const handleNext = useCallback(() => {
+    if (carouselNews.length === 0) return;
+    setCarouselIndex(prev => (prev + 1) % carouselNews.length);
+  }, [carouselNews.length]);
+
+  const handlePrev = useCallback(() => {
+    if (carouselNews.length === 0) return;
+    setCarouselIndex(prev => (prev - 1 + carouselNews.length) % carouselNews.length);
+  }, [carouselNews.length]);
+
   // Carousel Auto-scroll
   useEffect(() => {
     if (news.length === 0) return;
-    const interval = setInterval(() => {
-      setCarouselIndex(prev => (prev + 1) % Math.min(news.length, 5));
-    }, 5000);
+    const interval = setInterval(handleNext, 5000);
     return () => clearInterval(interval);
-  }, [news]);
-
-  const carouselNews = news.slice(0, 5);
+  }, [news, handleNext]);
 
   return (
     <div className="min-h-screen bg-[#F8FAFC] text-slate-900 font-sans selection:bg-blue-100">
@@ -198,17 +206,24 @@ export default function App() {
             <AnimatePresence mode="wait">
               <motion.div
                 key={carouselIndex}
-                initial={{ opacity: 0, scale: 1.05 }}
-                animate={{ opacity: 1, scale: 1 }}
-                exit={{ opacity: 0 }}
-                transition={{ duration: 0.7 }}
-                className="absolute inset-0"
+                initial={{ opacity: 0, x: 20 }}
+                animate={{ opacity: 1, x: 0 }}
+                exit={{ opacity: 0, x: -20 }}
+                transition={{ duration: 0.5, ease: "easeInOut" }}
+                drag="x"
+                dragConstraints={{ left: 0, right: 0 }}
+                onDragEnd={(_, info) => {
+                  const swipeThreshold = 50;
+                  if (info.offset.x > swipeThreshold) handlePrev();
+                  else if (info.offset.x < -swipeThreshold) handleNext();
+                }}
+                className="absolute inset-0 cursor-grab active:cursor-grabbing"
               >
                 {/* Background Image */}
                 <img
                   src={carouselNews[carouselIndex].imageUrl}
                   alt=""
-                  className="w-full h-full object-cover"
+                  className="w-full h-full object-cover pointer-events-none"
                   referrerPolicy="no-referrer"
                   onError={(e) => {
                     (e.target as HTMLImageElement).src = `https://picsum.photos/seed/${encodeURIComponent(carouselNews[carouselIndex].id)}/1200/600`;
@@ -216,18 +231,18 @@ export default function App() {
                 />
                 
                 {/* Gradient Overlay for Readability */}
-                <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-black/40 to-transparent z-10" />
-                <div className="absolute inset-0 bg-gradient-to-r from-black/60 via-transparent to-transparent z-10 hidden md:block" />
+                <div className="absolute inset-0 bg-black/40 backdrop-blur-[2px] z-10" />
+                <div className="absolute inset-0 bg-gradient-to-b from-black/20 via-transparent to-black/60 z-10" />
 
-                {/* Content Overlay - Text only */}
-                <div className="absolute inset-0 z-20 p-6 pb-28 md:p-16 md:pb-28 flex flex-col justify-end max-w-full md:max-w-3xl space-y-4 overflow-hidden">
+                {/* Content Overlay - Centered with consistent padding */}
+                <div className="absolute inset-0 z-20 p-12 md:p-24 flex flex-col items-center justify-center text-center space-y-6">
                   <motion.div 
                     initial={{ y: 20, opacity: 0 }}
                     animate={{ y: 0, opacity: 1 }}
                     transition={{ delay: 0.2 }}
-                    className="space-y-3 md:space-y-4"
+                    className="space-y-4 max-w-3xl"
                   >
-                    <div className="flex flex-wrap items-center gap-2 md:gap-3">
+                    <div className="flex flex-wrap items-center justify-center gap-2 md:gap-3">
                       <span className="px-3 py-1 md:px-4 md:py-1.5 bg-blue-600/90 text-white text-[10px] md:text-xs font-bold rounded-full uppercase tracking-widest shadow-lg shadow-blue-500/20 backdrop-blur-sm">
                         {carouselNews[carouselIndex].category}
                       </span>
@@ -236,47 +251,51 @@ export default function App() {
                         {formatDistanceToNow(new Date(carouselNews[carouselIndex].pubDate), { locale: lang === 'zh' ? zhCN : enUS })} {t.ago}
                       </span>
                     </div>
-                    <h2 className="text-2xl md:text-5xl font-extrabold leading-tight text-white drop-shadow-lg line-clamp-2 md:line-clamp-none">
-                      {lang === 'zh' ? (carouselNews[carouselIndex].translatedTitle || carouselNews[carouselIndex].title) : carouselNews[carouselIndex].title}
-                    </h2>
-                    <p className="text-white/90 text-sm md:text-xl line-clamp-2 max-w-2xl font-medium drop-shadow-md hidden sm:block">
-                      {lang === 'zh' ? (carouselNews[carouselIndex].translatedSummary || carouselNews[carouselIndex].summary) : carouselNews[carouselIndex].summary}
-                    </p>
+                    
+                    {/* Fixed height container for headline to prevent layout shifts */}
+                    <div className="h-[80px] md:h-[120px] flex items-center justify-center overflow-hidden">
+                      <h2 className="text-2xl md:text-5xl font-extrabold leading-tight text-white drop-shadow-lg line-clamp-2">
+                        {lang === 'zh' ? (carouselNews[carouselIndex].translatedTitle || carouselNews[carouselIndex].title) : carouselNews[carouselIndex].title}
+                      </h2>
+                    </div>
+
+                    <div className="h-[60px] md:h-[80px] flex items-center justify-center overflow-hidden">
+                      <p className="text-white/90 text-sm md:text-xl line-clamp-2 md:line-clamp-3 font-medium drop-shadow-md">
+                        {lang === 'zh' ? (carouselNews[carouselIndex].translatedSummary || carouselNews[carouselIndex].summary) : carouselNews[carouselIndex].summary}
+                      </p>
+                    </div>
+                  </motion.div>
+
+                  <motion.div
+                    initial={{ y: 20, opacity: 0 }}
+                    animate={{ y: 0, opacity: 1 }}
+                    transition={{ delay: 0.4 }}
+                  >
+                    <a
+                      href={carouselNews[carouselIndex].link}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center gap-2 px-8 py-3.5 bg-white text-blue-600 text-sm font-bold rounded-xl hover:bg-blue-600 hover:text-white transition-all shadow-xl hover:shadow-blue-500/40 group/btn"
+                    >
+                      {t.readFull}
+                      <ExternalLink className="w-4 h-4 group-hover/btn:translate-x-0.5 group-hover/btn:-translate-y-0.5 transition-transform" />
+                    </a>
                   </motion.div>
                 </div>
-
-                {/* Action Button - Bottom Left */}
-                <motion.div
-                  key={carouselIndex}
-                  initial={{ opacity: 0, x: -20 }}
-                  animate={{ opacity: 1, x: 0 }}
-                  transition={{ delay: 0.4 }}
-                  className="absolute bottom-8 left-8 z-30"
-                >
-                  <a
-                    href={carouselNews[carouselIndex].link}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="inline-flex items-center gap-2 px-6 py-3 bg-white text-blue-600 text-sm font-bold rounded-xl hover:bg-blue-600 hover:text-white transition-all shadow-xl hover:shadow-blue-500/40 group/btn"
-                  >
-                    {t.readFull}
-                    <ExternalLink className="w-4 h-4 group-hover/btn:translate-x-0.5 group-hover/btn:-translate-y-0.5 transition-transform" />
-                  </a>
-                </motion.div>
               </motion.div>
             </AnimatePresence>
 
-            {/* Navigation Arrows - iOS 16 Style Glassmorphism */}
+            {/* Navigation Arrows - iOS 16 Style Glassmorphism (Visible on all devices) */}
             <button
-              onClick={() => setCarouselIndex(prev => (prev - 1 + carouselNews.length) % carouselNews.length)}
-              className="absolute left-2 md:left-4 top-1/2 -translate-y-1/2 z-30 p-2 md:p-3 bg-white/5 backdrop-blur-xl rounded-full hover:bg-white/15 shadow-xl transition-all border border-white/10 text-white/70 hover:text-white group/nav"
+              onClick={handlePrev}
+              className="absolute left-2 md:left-4 top-1/2 -translate-y-1/2 z-30 p-2 md:p-3 bg-white/5 backdrop-blur-xl rounded-full hover:bg-white/15 shadow-xl transition-all border border-white/10 text-white/70 hover:text-white group/nav flex"
               aria-label="Previous slide"
             >
               <ChevronLeft className="w-5 h-5 md:w-6 md:h-6 group-hover/nav:-translate-x-0.5 transition-transform" />
             </button>
             <button
-              onClick={() => setCarouselIndex(prev => (prev + 1) % carouselNews.length)}
-              className="absolute right-2 md:right-4 top-1/2 -translate-y-1/2 z-30 p-2 md:p-3 bg-white/5 backdrop-blur-xl rounded-full hover:bg-white/15 shadow-xl transition-all border border-white/10 text-white/70 hover:text-white group/nav"
+              onClick={handleNext}
+              className="absolute right-2 md:right-4 top-1/2 -translate-y-1/2 z-30 p-2 md:p-3 bg-white/5 backdrop-blur-xl rounded-full hover:bg-white/15 shadow-xl transition-all border border-white/10 text-white/70 hover:text-white group/nav flex"
               aria-label="Next slide"
             >
               <ChevronRight className="w-5 h-5 md:w-6 md:h-6 group-hover/nav:translate-x-0.5 transition-transform" />
