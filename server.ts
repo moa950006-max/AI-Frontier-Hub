@@ -1,6 +1,7 @@
 import express from "express";
 import { createServer as createViteServer } from "vite";
-import Database from "better-sqlite3";
+import { initializeApp } from "firebase/app";
+import { getFirestore, collection, doc, setDoc, getDoc, query, where, getDocs, writeBatch, count, getCountFromServer, orderBy, limit } from "firebase/firestore";
 import Parser from "rss-parser";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -8,8 +9,15 @@ import fs from "fs";
 import { createServer } from "http";
 import { Server } from "socket.io";
 
+// Import the Firebase configuration
+import firebaseConfig from "./firebase-applet-config.json" assert { type: "json" };
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+// Initialize Firebase Client SDK
+const firebaseApp = initializeApp(firebaseConfig);
+const db = getFirestore(firebaseApp, firebaseConfig.firestoreDatabaseId);
 
 const app = express();
 const httpServer = createServer(app);
@@ -21,55 +29,7 @@ const io = new Server(httpServer, {
 });
 
 const PORT = 3000;
-const db = new Database("news.db");
 const parser = new Parser({
-  customFields: {
-    item: [
-      ['media:content', 'mediaContent', { keepArray: true }],
-      ['media:thumbnail', 'mediaThumbnail'],
-      ['content:encoded', 'contentEncoded'],
-      ['enclosure', 'enclosure'],
-    ],
-  },
-});
-
-async function getOgImage(url: string): Promise<string | null> {
-  try {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 3000); // 3s timeout
-    const res = await fetch(url, { signal: controller.signal });
-    clearTimeout(timeoutId);
-    const html = await res.text();
-    const match = html.match(/<meta[^>]+property="og:image"[^>]+content="([^">]+)"/i) ||
-                  html.match(/<meta[^>]+content="([^">]+)"[^>]+property="og:image"/i);
-    return match ? match[1] : null;
-  } catch (e) {
-    return null;
-  }
-}
-
-// Initialize Database - Ensure imageUrl column exists
-try {
-  db.exec("ALTER TABLE news ADD COLUMN imageUrl TEXT");
-} catch (e) {
-  // Column might already exist or table doesn't exist yet
-}
-
-db.exec(`
-  CREATE TABLE IF NOT EXISTS news (
-    id TEXT PRIMARY KEY,
-    title TEXT,
-    link TEXT,
-    pubDate TEXT,
-    content TEXT,
-    source TEXT,
-    category TEXT,
-    summary TEXT,
-    imageUrl TEXT
-  )
-`);
-
-const FEEDS = [
   { name: "TechCrunch AI", url: "https://techcrunch.com/category/artificial-intelligence/feed/" },
   { name: "VentureBeat AI", url: "https://venturebeat.com/category/ai/feed/" },
   { name: "MIT Tech Review", url: "https://www.technologyreview.com/topic/artificial-intelligence/feed/" },
@@ -106,17 +66,14 @@ async function fetchNews() {
   oneMonthAgo.setMonth(oneMonthAgo.getMonth() - 1);
 
   let totalFetched = 0;
+  const newsCollection = collection(db, "news");
+
   for (const feed of FEEDS) {
     try {
       console.log(`Fetching ${feed.name} from ${feed.url}`);
       const data = await parser.parseURL(feed.url);
       console.log(`Received ${data.items.length} items from ${feed.name}`);
       
-      const insert = db.prepare(`
-        INSERT OR IGNORE INTO news (id, title, link, pubDate, content, source, category, summary, imageUrl)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `);
-
       let feedCount = 0;
       for (const item of data.items) {
         const pubDateStr = item.pubDate || new Date().toISOString();
@@ -126,6 +83,8 @@ async function fetchNews() {
         if (pubDate < oneMonthAgo) continue;
 
         const id = item.guid || item.link || item.title;
+        const docId = Buffer.from(id).toString('base64').replace(/\//g, '_').replace(/\+/g, '-');
+
         const title = item.title || "No Title";
         const link = item.link || "";
         const content = item.contentSnippet || item.content || "";
@@ -163,10 +122,14 @@ async function fetchNews() {
 
         // 5. Deep fetch if still no image (only for new items)
         if (!imageUrl && link) {
-          const existing = db.prepare("SELECT imageUrl FROM news WHERE id = ?").get(id) as any;
-          if (!existing || !existing.imageUrl || existing.imageUrl.includes("picsum.photos")) {
+          const docRef = doc(newsCollection, docId);
+          const docSnap = await getDoc(docRef);
+          const existingData = docSnap.data();
+          if (!existingData || !existingData.imageUrl || existingData.imageUrl.includes("picsum.photos")) {
              const ogImage = await getOgImage(link);
              if (ogImage) imageUrl = ogImage;
+          } else {
+            imageUrl = existingData.imageUrl;
           }
         }
         
@@ -180,7 +143,10 @@ async function fetchNews() {
           imageUrl = `https://images.weserv.nl/?url=${encodeURIComponent(imageUrl)}&w=800&h=450&fit=cover`;
         }
 
-        insert.run(id, title, link, pubDate.toISOString(), content, source, category, summary, imageUrl);
+        await setDoc(doc(newsCollection, docId), {
+          id, title, link, pubDate: pubDate.toISOString(), content, source, category, summary, imageUrl
+        }, { merge: true });
+        
         feedCount++;
       }
       totalFetched += feedCount;
@@ -191,8 +157,11 @@ async function fetchNews() {
   }
   
   // Cleanup news older than 1 month
-  const cleanup = db.prepare("DELETE FROM news WHERE pubDate < ?");
-  cleanup.run(oneMonthAgo.toISOString());
+  const oldNewsQuery = query(newsCollection, where("pubDate", "<", oneMonthAgo.toISOString()));
+  const oldNewsSnapshot = await getDocs(oldNewsQuery);
+  const batch = writeBatch(db);
+  oldNewsSnapshot.forEach(doc => batch.delete(doc.ref));
+  await batch.commit();
   
   console.log(`[${new Date().toISOString()}] News fetch complete. Total items processed: ${totalFetched}`);
   
@@ -206,41 +175,57 @@ async function fetchNews() {
 app.use(express.json());
 
 // Health Check
-app.get("/api/health", (req, res) => {
+app.get("/api/health", async (req, res) => {
   const distExists = fs.existsSync(path.join(__dirname, "dist"));
+  let newsCount = 0;
+  try {
+    const snapshot = await getCountFromServer(collection(db, "news"));
+    newsCount = snapshot.data().count;
+  } catch (e) {}
+  
   res.json({ 
     status: "ok", 
     dbConnected: !!db,
-    newsCount: db.prepare("SELECT count(*) as count FROM news").get(),
+    newsCount,
     distExists,
     nodeEnv: process.env.NODE_ENV
   });
 });
 
 // API Endpoints
-app.get("/api/news", (req, res) => {
-  const { category, search, limit = 50 } = req.query;
+app.get("/api/news", async (req, res) => {
+  const { category, search, limit: limitVal = 50 } = req.query;
   const oneMonthAgo = new Date();
   oneMonthAgo.setMonth(oneMonthAgo.getMonth() - 1);
 
-  let query = "SELECT * FROM news WHERE pubDate >= ?";
-  const params: any[] = [oneMonthAgo.toISOString()];
+  try {
+    let q = query(
+      collection(db, "news"),
+      where("pubDate", ">=", oneMonthAgo.toISOString()),
+      orderBy("pubDate", "desc"),
+      limit(Number(limitVal))
+    );
 
-  if (category && category !== "All") {
-    query += " AND category = ?";
-    params.push(category);
+    if (category && category !== "All") {
+      q = query(q, where("category", "==", category));
+    }
+
+    const snapshot = await getDocs(q);
+    let rows = snapshot.docs.map(doc => doc.data());
+    
+    if (search) {
+      const s = String(search).toLowerCase();
+      rows = rows.filter((row: any) => 
+        row.title.toLowerCase().includes(s) || 
+        row.content.toLowerCase().includes(s)
+      );
+    }
+    
+    res.json(rows);
+  } catch (err) {
+    console.error("Error fetching news from Firestore:", err);
+    res.status(500).json({ error: "Failed to fetch news" });
   }
-
-  if (search) {
-    query += " AND (title LIKE ? OR content LIKE ?)";
-    params.push(`%${search}%`, `%${search}%`);
-  }
-
-  query += " ORDER BY pubDate DESC LIMIT ?";
-  params.push(limit);
-
-  const rows = db.prepare(query).all(...params);
-  res.json(rows);
 });
 
 app.get("/api/categories", (req, res) => {

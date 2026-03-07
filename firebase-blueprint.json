@@ -1,0 +1,27 @@
+{
+  "entities": {
+    "NewsItem": {
+      "title": "NewsItem",
+      "description": "A single news item fetched from RSS feeds.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Unique identifier for the news item." },
+        "title": { "type": "string", "description": "Title of the news item." },
+        "link": { "type": "string", "description": "URL to the full news story." },
+        "pubDate": { "type": "string", "format": "date-time", "description": "Publication date of the news item." },
+        "content": { "type": "string", "description": "Full content or snippet of the news item." },
+        "source": { "type": "string", "description": "Source of the news item (e.g., TechCrunch)." },
+        "category": { "type": "string", "description": "Category of the news item." },
+        "summary": { "type": "string", "description": "Short summary of the news item." },
+        "imageUrl": { "type": "string", "description": "URL to the news item's image." }
+      },
+      "required": ["id", "title", "link", "pubDate", "source", "category"]
+    }
+  },
+  "firestore": {
+    "/news": {
+      "schema": "NewsItem",
+      "description": "Collection of AI news items."
+    }
+  }
+}

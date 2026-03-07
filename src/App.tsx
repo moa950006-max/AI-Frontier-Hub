@@ -7,6 +7,109 @@ import { clsx, type ClassValue } from "clsx";
 import { twMerge } from "tailwind-merge";
 import { GoogleGenAI } from "@google/genai";
 import { io } from "socket.io-client";
+import { initializeApp } from "firebase/app";
+import { getFirestore, collection, query, where, orderBy, limit, onSnapshot, getDocs } from "firebase/firestore";
+import { getAuth, onAuthStateChanged, signInAnonymously } from "firebase/auth";
+import firebaseConfig from "../firebase-applet-config.json";
+
+// Initialize Firebase
+const app = initializeApp(firebaseConfig);
+const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
+const auth = getAuth(app);
+
+// Firestore Error Handling
+enum OperationType {
+  CREATE = 'create',
+  UPDATE = 'update',
+  DELETE = 'delete',
+  LIST = 'list',
+  GET = 'get',
+  WRITE = 'write',
+}
+
+interface FirestoreErrorInfo {
+  error: string;
+  operationType: OperationType;
+  path: string | null;
+  authInfo: {
+    userId: string | undefined;
+    email: string | null | undefined;
+    emailVerified: boolean | undefined;
+    isAnonymous: boolean | undefined;
+    tenantId: string | null | undefined;
+    providerInfo: {
+      providerId: string;
+      displayName: string | null;
+      email: string | null;
+      photoUrl: string | null;
+    }[];
+  }
+}
+
+function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null) {
+  const errInfo: FirestoreErrorInfo = {
+    error: error instanceof Error ? error.message : String(error),
+    authInfo: {
+      userId: auth.currentUser?.uid,
+      email: auth.currentUser?.email,
+      emailVerified: auth.currentUser?.emailVerified,
+      isAnonymous: auth.currentUser?.isAnonymous,
+      tenantId: auth.currentUser?.tenantId,
+      providerInfo: auth.currentUser?.providerData.map(provider => ({
+        providerId: provider.providerId,
+        displayName: provider.displayName,
+        email: provider.email,
+        photoUrl: provider.photoURL
+      })) || []
+    },
+    operationType,
+    path
+  }
+  console.error('Firestore Error: ', JSON.stringify(errInfo));
+  throw new Error(JSON.stringify(errInfo));
+}
+
+// Error Boundary Component
+class ErrorBoundary extends React.Component<{ children: React.ReactNode }, { hasError: boolean, error: any }> {
+  constructor(props: { children: React.ReactNode }) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+
+  static getDerivedStateFromError(error: any) {
+    return { hasError: true, error };
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="min-h-screen flex items-center justify-center bg-slate-50 p-4">
+          <div className="max-w-md w-full bg-white rounded-2xl shadow-xl p-8 text-center space-y-4">
+            <div className="w-16 h-16 bg-red-100 text-red-600 rounded-full flex items-center justify-center mx-auto">
+              <RefreshCw className="w-8 h-8" />
+            </div>
+            <h2 className="text-2xl font-bold text-slate-900">Something went wrong</h2>
+            <p className="text-slate-500 text-sm">
+              We encountered an error while loading the application. Please try refreshing the page.
+            </p>
+            <button
+              onClick={() => window.location.reload()}
+              className="w-full py-3 bg-blue-600 text-white rounded-xl font-bold hover:bg-blue-700 transition-colors"
+            >
+              Refresh Page
+            </button>
+            {process.env.NODE_ENV !== 'production' && (
+              <pre className="mt-4 p-4 bg-slate-100 rounded text-left text-xs overflow-auto max-h-40">
+                {this.state.error?.message}
+              </pre>
+            )}
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
 
 // Utility for tailwind classes
 function cn(...inputs: ClassValue[]) {
@@ -64,7 +167,15 @@ const TRANSLATIONS = {
   }
 };
 
-export default function App() {
+export default function AppWrapper() {
+  return (
+    <ErrorBoundary>
+      <App />
+    </ErrorBoundary>
+  );
+}
+
+function App() {
   const [news, setNews] = useState<NewsItem[]>([]);
   const [categories, setCategories] = useState<string[]>([]);
   const [selectedCategory, setSelectedCategory] = useState("All");
@@ -74,21 +185,57 @@ export default function App() {
   const [lang, setLang] = useState<Language>("en");
   const [translating, setTranslating] = useState(false);
   const [now, setNow] = useState(new Date());
+  const [isAuthReady, setIsAuthReady] = useState(false);
 
   const t = TRANSLATIONS[lang];
 
+  // Auth initialization
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, (user) => {
+      if (!user) {
+        signInAnonymously(auth).catch(console.error);
+      }
+      setIsAuthReady(true);
+    });
+    return () => unsubscribe();
+  }, []);
+
   const fetchNews = useCallback(async () => {
+    if (!isAuthReady) return;
     setLoading(true);
     try {
-      const res = await fetch(`/api/news?category=${selectedCategory}&search=${searchQuery}`);
-      const data = await res.json();
+      const oneMonthAgo = new Date();
+      oneMonthAgo.setMonth(oneMonthAgo.getMonth() - 1);
+
+      let q = query(
+        collection(db, "news"),
+        where("pubDate", ">=", oneMonthAgo.toISOString()),
+        orderBy("pubDate", "desc"),
+        limit(50)
+      );
+
+      if (selectedCategory !== "All") {
+        q = query(q, where("category", "==", selectedCategory));
+      }
+
+      const snapshot = await getDocs(q);
+      let data = snapshot.docs.map(doc => doc.data() as NewsItem);
+
+      if (searchQuery) {
+        const s = searchQuery.toLowerCase();
+        data = data.filter(item => 
+          item.title.toLowerCase().includes(s) || 
+          item.summary.toLowerCase().includes(s)
+        );
+      }
+
       setNews(data);
     } catch (err) {
-      console.error("Failed to fetch news:", err);
+      handleFirestoreError(err, OperationType.GET, "news");
     } finally {
       setLoading(false);
     }
-  }, [selectedCategory, searchQuery]);
+  }, [selectedCategory, searchQuery, isAuthReady]);
 
   useEffect(() => {
     fetch("/api/categories")
@@ -96,28 +243,43 @@ export default function App() {
       .then(setCategories);
   }, []);
 
+  // Real-time updates via Firestore onSnapshot
   useEffect(() => {
-    fetchNews();
-  }, [fetchNews]);
+    if (!isAuthReady) return;
 
-  // Real-time updates via WebSockets
-  useEffect(() => {
-    const socket = io();
-    
-    socket.on("connect", () => {
-      console.log("Connected to real-time news server");
+    const oneMonthAgo = new Date();
+    oneMonthAgo.setMonth(oneMonthAgo.getMonth() - 1);
+
+    let q = query(
+      collection(db, "news"),
+      where("pubDate", ">=", oneMonthAgo.toISOString()),
+      orderBy("pubDate", "desc"),
+      limit(50)
+    );
+
+    if (selectedCategory !== "All") {
+      q = query(q, where("category", "==", selectedCategory));
+    }
+
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      let data = snapshot.docs.map(doc => doc.data() as NewsItem);
+      
+      if (searchQuery) {
+        const s = searchQuery.toLowerCase();
+        data = data.filter(item => 
+          item.title.toLowerCase().includes(s) || 
+          item.summary.toLowerCase().includes(s)
+        );
+      }
+      
+      setNews(data);
+      setLoading(false);
+    }, (err) => {
+      handleFirestoreError(err, OperationType.GET, "news");
     });
 
-    socket.on("news-updated", (data) => {
-      console.log("Real-time update received:", data);
-      // Refresh news when server notifies of new items
-      fetchNews();
-    });
-
-    return () => {
-      socket.disconnect();
-    };
-  }, [fetchNews]);
+    return () => unsubscribe();
+  }, [selectedCategory, searchQuery, isAuthReady]);
 
   // Translation Logic
   useEffect(() => {
