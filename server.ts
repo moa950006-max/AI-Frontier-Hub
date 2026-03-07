@@ -4,11 +4,22 @@ import Database from "better-sqlite3";
 import Parser from "rss-parser";
 import path from "path";
 import { fileURLToPath } from "url";
+import fs from "fs";
+import { createServer } from "http";
+import { Server } from "socket.io";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
+const httpServer = createServer(app);
+const io = new Server(httpServer, {
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST"]
+  }
+});
+
 const PORT = 3000;
 const db = new Database("news.db");
 const parser = new Parser({
@@ -90,18 +101,23 @@ function classify(title: string, content: string): string {
 }
 
 async function fetchNews() {
-  console.log("Fetching news...");
+  console.log(`[${new Date().toISOString()}] Fetching news...`);
   const oneMonthAgo = new Date();
   oneMonthAgo.setMonth(oneMonthAgo.getMonth() - 1);
 
+  let totalFetched = 0;
   for (const feed of FEEDS) {
     try {
+      console.log(`Fetching ${feed.name} from ${feed.url}`);
       const data = await parser.parseURL(feed.url);
+      console.log(`Received ${data.items.length} items from ${feed.name}`);
+      
       const insert = db.prepare(`
         INSERT OR IGNORE INTO news (id, title, link, pubDate, content, source, category, summary, imageUrl)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
 
+      let feedCount = 0;
       for (const item of data.items) {
         const pubDateStr = item.pubDate || new Date().toISOString();
         const pubDate = new Date(pubDateStr);
@@ -165,7 +181,10 @@ async function fetchNews() {
         }
 
         insert.run(id, title, link, pubDate.toISOString(), content, source, category, summary, imageUrl);
+        feedCount++;
       }
+      totalFetched += feedCount;
+      console.log(`Saved ${feedCount} new/updated items from ${feed.name}`);
     } catch (err) {
       console.error(`Error fetching ${feed.name}:`, err);
     }
@@ -175,14 +194,28 @@ async function fetchNews() {
   const cleanup = db.prepare("DELETE FROM news WHERE pubDate < ?");
   cleanup.run(oneMonthAgo.toISOString());
   
-  console.log("News fetch and cleanup complete.");
+  console.log(`[${new Date().toISOString()}] News fetch complete. Total items processed: ${totalFetched}`);
+  
+  if (totalFetched > 0) {
+    io.emit("news-updated", { count: totalFetched, timestamp: new Date().toISOString() });
+  }
 }
 
-// Initial fetch and schedule
-fetchNews();
-setInterval(fetchNews, 10 * 60 * 1000); // Every 10 minutes
+// Initial fetch and schedule removed from top level - moved to startServer
 
 app.use(express.json());
+
+// Health Check
+app.get("/api/health", (req, res) => {
+  const distExists = fs.existsSync(path.join(__dirname, "dist"));
+  res.json({ 
+    status: "ok", 
+    dbConnected: !!db,
+    newsCount: db.prepare("SELECT count(*) as count FROM news").get(),
+    distExists,
+    nodeEnv: process.env.NODE_ENV
+  });
+});
 
 // API Endpoints
 app.get("/api/news", (req, res) => {
@@ -215,6 +248,16 @@ app.get("/api/categories", (req, res) => {
 });
 
 async function startServer() {
+  console.log("Starting server...");
+  
+  // Initial fetch
+  fetchNews().catch(err => console.error("Initial fetch failed:", err));
+  
+  // Schedule periodic fetch
+  setInterval(() => {
+    fetchNews().catch(err => console.error("Periodic fetch failed:", err));
+  }, 10 * 60 * 1000);
+
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -222,13 +265,16 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
-    app.use(express.static(path.join(__dirname, "dist")));
+    const distPath = path.join(__dirname, "dist");
+    console.log(`Serving static files from ${distPath}`);
+    app.use(express.static(distPath));
     app.get("*", (req, res) => {
-      res.sendFile(path.join(__dirname, "dist", "index.html"));
+      const indexPath = path.join(distPath, "index.html");
+      res.sendFile(indexPath);
     });
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
+  httpServer.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on http://localhost:${PORT}`);
   });
 }

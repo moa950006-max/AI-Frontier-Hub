@@ -6,6 +6,7 @@ import { zhCN, enUS } from "date-fns/locale";
 import { clsx, type ClassValue } from "clsx";
 import { twMerge } from "tailwind-merge";
 import { GoogleGenAI } from "@google/genai";
+import { io } from "socket.io-client";
 
 // Utility for tailwind classes
 function cn(...inputs: ClassValue[]) {
@@ -72,6 +73,7 @@ export default function App() {
   const [carouselIndex, setCarouselIndex] = useState(0);
   const [lang, setLang] = useState<Language>("en");
   const [translating, setTranslating] = useState(false);
+  const [now, setNow] = useState(new Date());
 
   const t = TRANSLATIONS[lang];
 
@@ -96,6 +98,25 @@ export default function App() {
 
   useEffect(() => {
     fetchNews();
+  }, [fetchNews]);
+
+  // Real-time updates via WebSockets
+  useEffect(() => {
+    const socket = io();
+    
+    socket.on("connect", () => {
+      console.log("Connected to real-time news server");
+    });
+
+    socket.on("news-updated", (data) => {
+      console.log("Real-time update received:", data);
+      // Refresh news when server notifies of new items
+      fetchNews();
+    });
+
+    return () => {
+      socket.disconnect();
+    };
   }, [fetchNews]);
 
   // Translation Logic
@@ -135,6 +156,12 @@ export default function App() {
       setTranslating(false);
     }
   };
+
+  // Update 'now' every minute to refresh 'time ago' labels
+  useEffect(() => {
+    const interval = setInterval(() => setNow(new Date()), 60000);
+    return () => clearInterval(interval);
+  }, []);
 
   const carouselNews = news.slice(0, 5);
 
