@@ -219,65 +219,68 @@ export default function App() {
                 <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-black/40 to-transparent z-10" />
                 <div className="absolute inset-0 bg-gradient-to-r from-black/60 via-transparent to-transparent z-10 hidden md:block" />
 
-                {/* Content Overlay */}
-                <div className="absolute inset-0 z-20 p-8 pr-24 md:p-16 md:pr-48 flex flex-col justify-end max-w-3xl space-y-6">
+                {/* Content Overlay - Text only */}
+                <div className="absolute inset-0 z-20 p-6 pb-28 md:p-16 md:pb-28 flex flex-col justify-end max-w-full md:max-w-3xl space-y-4 overflow-hidden">
                   <motion.div 
                     initial={{ y: 20, opacity: 0 }}
                     animate={{ y: 0, opacity: 1 }}
                     transition={{ delay: 0.2 }}
-                    className="space-y-4"
+                    className="space-y-3 md:space-y-4"
                   >
-                    <div className="flex items-center gap-3">
-                      <span className="px-4 py-1.5 bg-blue-600 text-white text-xs font-bold rounded-full uppercase tracking-widest shadow-lg shadow-blue-500/30">
+                    <div className="flex flex-wrap items-center gap-2 md:gap-3">
+                      <span className="px-3 py-1 md:px-4 md:py-1.5 bg-blue-600/90 text-white text-[10px] md:text-xs font-bold rounded-full uppercase tracking-widest shadow-lg shadow-blue-500/20 backdrop-blur-sm">
                         {carouselNews[carouselIndex].category}
                       </span>
-                      <span className="text-white/80 text-sm font-medium flex items-center gap-1.5 backdrop-blur-sm bg-black/20 px-3 py-1 rounded-full">
-                        <Clock className="w-4 h-4" />
+                      <span className="text-white/80 text-[10px] md:text-sm font-medium flex items-center gap-1 md:gap-1.5 backdrop-blur-md bg-white/10 border border-white/10 px-2.5 py-1 md:px-3 md:py-1 rounded-full">
+                        <Clock className="w-3.5 h-3.5 md:w-4 h-4" />
                         {formatDistanceToNow(new Date(carouselNews[carouselIndex].pubDate), { locale: lang === 'zh' ? zhCN : enUS })} {t.ago}
                       </span>
                     </div>
-                    <h2 className="text-3xl md:text-5xl font-extrabold leading-tight text-white drop-shadow-lg">
+                    <h2 className="text-2xl md:text-5xl font-extrabold leading-tight text-white drop-shadow-lg line-clamp-2 md:line-clamp-none">
                       {lang === 'zh' ? (carouselNews[carouselIndex].translatedTitle || carouselNews[carouselIndex].title) : carouselNews[carouselIndex].title}
                     </h2>
-                    <p className="text-white/90 text-lg md:text-xl line-clamp-2 max-w-2xl font-medium drop-shadow-md">
+                    <p className="text-white/90 text-sm md:text-xl line-clamp-2 max-w-2xl font-medium drop-shadow-md hidden sm:block">
                       {lang === 'zh' ? (carouselNews[carouselIndex].translatedSummary || carouselNews[carouselIndex].summary) : carouselNews[carouselIndex].summary}
                     </p>
                   </motion.div>
-                  
-                  <motion.div
-                    initial={{ y: 20, opacity: 0 }}
-                    animate={{ y: 0, opacity: 1 }}
-                    transition={{ delay: 0.4 }}
-                  >
-                    <a
-                      href={carouselNews[carouselIndex].link}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="inline-flex items-center gap-3 px-8 py-4 bg-white text-blue-600 font-bold rounded-2xl hover:bg-blue-600 hover:text-white transition-all shadow-xl hover:shadow-blue-500/40 group/btn"
-                    >
-                      {t.readFull}
-                      <ExternalLink className="w-5 h-5 group-hover/btn:translate-x-1 group-hover/btn:-translate-y-1 transition-transform" />
-                    </a>
-                  </motion.div>
                 </div>
+
+                {/* Action Button - Bottom Left */}
+                <motion.div
+                  key={carouselIndex}
+                  initial={{ opacity: 0, x: -20 }}
+                  animate={{ opacity: 1, x: 0 }}
+                  transition={{ delay: 0.4 }}
+                  className="absolute bottom-8 left-8 z-30"
+                >
+                  <a
+                    href={carouselNews[carouselIndex].link}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center gap-2 px-6 py-3 bg-white text-blue-600 text-sm font-bold rounded-xl hover:bg-blue-600 hover:text-white transition-all shadow-xl hover:shadow-blue-500/40 group/btn"
+                  >
+                    {t.readFull}
+                    <ExternalLink className="w-4 h-4 group-hover/btn:translate-x-0.5 group-hover/btn:-translate-y-0.5 transition-transform" />
+                  </a>
+                </motion.div>
               </motion.div>
             </AnimatePresence>
 
-            {/* Carousel Controls */}
-            <div className="absolute bottom-12 right-12 z-30 flex gap-3">
-              <button
-                onClick={() => setCarouselIndex(prev => (prev - 1 + carouselNews.length) % carouselNews.length)}
-                className="p-4 bg-white/10 backdrop-blur-xl rounded-2xl hover:bg-white/20 shadow-2xl transition-all border border-white/20 text-white"
-              >
-                <ChevronLeft className="w-6 h-6" />
-              </button>
-              <button
-                onClick={() => setCarouselIndex(prev => (prev + 1) % carouselNews.length)}
-                className="p-4 bg-white/10 backdrop-blur-xl rounded-2xl hover:bg-white/20 shadow-2xl transition-all border border-white/20 text-white"
-              >
-                <ChevronRight className="w-6 h-6" />
-              </button>
-            </div>
+            {/* Navigation Arrows - iOS 16 Style Glassmorphism */}
+            <button
+              onClick={() => setCarouselIndex(prev => (prev - 1 + carouselNews.length) % carouselNews.length)}
+              className="absolute left-2 md:left-4 top-1/2 -translate-y-1/2 z-30 p-2 md:p-3 bg-white/5 backdrop-blur-xl rounded-full hover:bg-white/15 shadow-xl transition-all border border-white/10 text-white/70 hover:text-white group/nav"
+              aria-label="Previous slide"
+            >
+              <ChevronLeft className="w-5 h-5 md:w-6 md:h-6 group-hover/nav:-translate-x-0.5 transition-transform" />
+            </button>
+            <button
+              onClick={() => setCarouselIndex(prev => (prev + 1) % carouselNews.length)}
+              className="absolute right-2 md:right-4 top-1/2 -translate-y-1/2 z-30 p-2 md:p-3 bg-white/5 backdrop-blur-xl rounded-full hover:bg-white/15 shadow-xl transition-all border border-white/10 text-white/70 hover:text-white group/nav"
+              aria-label="Next slide"
+            >
+              <ChevronRight className="w-5 h-5 md:w-6 md:h-6 group-hover/nav:translate-x-0.5 transition-transform" />
+            </button>
           </section>
         )}
 
