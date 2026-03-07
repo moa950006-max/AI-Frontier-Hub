@@ -17,9 +17,25 @@ const parser = new Parser({
       ['media:content', 'mediaContent', { keepArray: true }],
       ['media:thumbnail', 'mediaThumbnail'],
       ['content:encoded', 'contentEncoded'],
+      ['enclosure', 'enclosure'],
     ],
   },
 });
+
+async function getOgImage(url: string): Promise<string | null> {
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 3000); // 3s timeout
+    const res = await fetch(url, { signal: controller.signal });
+    clearTimeout(timeoutId);
+    const html = await res.text();
+    const match = html.match(/<meta[^>]+property="og:image"[^>]+content="([^">]+)"/i) ||
+                  html.match(/<meta[^>]+content="([^">]+)"[^>]+property="og:image"/i);
+    return match ? match[1] : null;
+  } catch (e) {
+    return null;
+  }
+}
 
 // Initialize Database - Ensure imageUrl column exists
 try {
@@ -75,6 +91,9 @@ function classify(title: string, content: string): string {
 
 async function fetchNews() {
   console.log("Fetching news...");
+  const oneMonthAgo = new Date();
+  oneMonthAgo.setMonth(oneMonthAgo.getMonth() - 1);
+
   for (const feed of FEEDS) {
     try {
       const data = await parser.parseURL(feed.url);
@@ -84,10 +103,15 @@ async function fetchNews() {
       `);
 
       for (const item of data.items) {
+        const pubDateStr = item.pubDate || new Date().toISOString();
+        const pubDate = new Date(pubDateStr);
+        
+        // Skip news older than 1 month
+        if (pubDate < oneMonthAgo) continue;
+
         const id = item.guid || item.link || item.title;
         const title = item.title || "No Title";
         const link = item.link || "";
-        const pubDate = item.pubDate || new Date().toISOString();
         const content = item.contentSnippet || item.content || "";
         const source = feed.name;
         const category = classify(title, content);
@@ -97,9 +121,11 @@ async function fetchNews() {
         let imageUrl = "";
         
         // 1. Check media:content
-        if (item.mediaContent && item.mediaContent.length > 0) {
+        if (item.mediaContent && Array.isArray(item.mediaContent)) {
           const media = item.mediaContent.find((m: any) => m.$ && m.$.url);
           if (media) imageUrl = media.$.url;
+        } else if (item.mediaContent && (item.mediaContent as any).$ && (item.mediaContent as any).$.url) {
+          imageUrl = (item.mediaContent as any).$.url;
         }
         
         // 2. Check media:thumbnail
@@ -115,22 +141,41 @@ async function fetchNews() {
         // 4. Check content for <img> tags
         if (!imageUrl) {
           const searchIn = (item.content || "") + (item.contentEncoded || "");
-          const imgMatch = searchIn.match(/<img[^>]+src="([^">]+)"/);
+          const imgMatch = searchIn.match(/<img[^>]+src="([^">]+)"/i);
           if (imgMatch) imageUrl = imgMatch[1];
         }
+
+        // 5. Deep fetch if still no image (only for new items)
+        if (!imageUrl && link) {
+          const existing = db.prepare("SELECT imageUrl FROM news WHERE id = ?").get(id) as any;
+          if (!existing || !existing.imageUrl || existing.imageUrl.includes("picsum.photos")) {
+             const ogImage = await getOgImage(link);
+             if (ogImage) imageUrl = ogImage;
+          }
+        }
         
-        // 5. Fallback
+        // 6. Fallback
         if (!imageUrl || imageUrl.includes("feedburner")) {
           imageUrl = `https://picsum.photos/seed/${encodeURIComponent(id)}/800/450`;
         }
 
-        insert.run(id, title, link, pubDate, content, source, category, summary, imageUrl);
+        // Use images.weserv.nl to proxy and resize images (helps with hotlinking and performance)
+        if (imageUrl && !imageUrl.includes("picsum.photos") && !imageUrl.includes("weserv.nl")) {
+          imageUrl = `https://images.weserv.nl/?url=${encodeURIComponent(imageUrl)}&w=800&h=450&fit=cover`;
+        }
+
+        insert.run(id, title, link, pubDate.toISOString(), content, source, category, summary, imageUrl);
       }
     } catch (err) {
       console.error(`Error fetching ${feed.name}:`, err);
     }
   }
-  console.log("News fetch complete.");
+  
+  // Cleanup news older than 1 month
+  const cleanup = db.prepare("DELETE FROM news WHERE pubDate < ?");
+  cleanup.run(oneMonthAgo.toISOString());
+  
+  console.log("News fetch and cleanup complete.");
 }
 
 // Initial fetch and schedule
@@ -142,8 +187,11 @@ app.use(express.json());
 // API Endpoints
 app.get("/api/news", (req, res) => {
   const { category, search, limit = 50 } = req.query;
-  let query = "SELECT * FROM news WHERE 1=1";
-  const params: any[] = [];
+  const oneMonthAgo = new Date();
+  oneMonthAgo.setMonth(oneMonthAgo.getMonth() - 1);
+
+  let query = "SELECT * FROM news WHERE pubDate >= ?";
+  const params: any[] = [oneMonthAgo.toISOString()];
 
   if (category && category !== "All") {
     query += " AND category = ?";
@@ -155,8 +203,6 @@ app.get("/api/news", (req, res) => {
     params.push(`%${search}%`, `%${search}%`);
   }
 
-  // Filter for last 24 hours (simplified for SQLite)
-  // In a real app, we'd use proper date comparison
   query += " ORDER BY pubDate DESC LIMIT ?";
   params.push(limit);
 

@@ -220,7 +220,7 @@ export default function App() {
                 <div className="absolute inset-0 bg-gradient-to-r from-black/60 via-transparent to-transparent z-10 hidden md:block" />
 
                 {/* Content Overlay */}
-                <div className="absolute inset-0 z-20 p-8 md:p-16 flex flex-col justify-end max-w-4xl space-y-6">
+                <div className="absolute inset-0 z-20 p-8 pr-24 md:p-16 md:pr-48 flex flex-col justify-end max-w-3xl space-y-6">
                   <motion.div 
                     initial={{ y: 20, opacity: 0 }}
                     animate={{ y: 0, opacity: 1 }}
