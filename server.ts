@@ -1,7 +1,7 @@
 import express from "express";
 import { createServer as createViteServer } from "vite";
 import { initializeApp } from "firebase/app";
-import { getFirestore, collection, doc, setDoc, getDoc, query, where, getDocs, writeBatch, count, getCountFromServer, orderBy, limit } from "firebase/firestore";
+import { getFirestore, collection, doc, setDoc, getDoc, query, where, orderBy, limit, getDocs, count, writeBatch } from "firebase/firestore";
 import Parser from "rss-parser";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -15,9 +15,11 @@ import firebaseConfig from "./firebase-applet-config.json" assert { type: "json"
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Initialize Firebase Client SDK
+// Initialize Firebase Client SDK on server
 const firebaseApp = initializeApp(firebaseConfig);
 const db = getFirestore(firebaseApp, firebaseConfig.firestoreDatabaseId);
+
+const newsCollection = collection(db, "news");
 
 const app = express();
 const httpServer = createServer(app);
@@ -29,15 +31,16 @@ const io = new Server(httpServer, {
 });
 
 const PORT = 3000;
-const parser = new Parser({
+const parser = new Parser();
+const FEEDS = [
   { name: "TechCrunch AI", url: "https://techcrunch.com/category/artificial-intelligence/feed/" },
   { name: "VentureBeat AI", url: "https://venturebeat.com/category/ai/feed/" },
   { name: "MIT Tech Review", url: "https://www.technologyreview.com/topic/artificial-intelligence/feed/" },
   { name: "arXiv AI", url: "https://arxiv.org/rss/cs.AI" },
-  { name: "The Verge AI", url: "https://www.theverge.com/ai-artificial-intelligence/rss/index.xml" },
-  { name: "Wired AI", url: "https://www.wired.com/feed/category/ai/latest/rss" },
+  { name: "The Verge AI", url: "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml" },
+  { name: "Wired AI", url: "https://www.wired.com/feed/tag/ai/latest/rss" },
   { name: "SCMP Tech (China)", url: "https://www.scmp.com/rss/318208/feed" },
-  { name: "Pandaily AI (China)", url: "https://pandaily.com/category/ai/feed/" },
+  { name: "Pandaily AI (China)", url: "https://pandaily.com/feed/" },
   { name: "Technode AI (China)", url: "https://technode.com/tag/ai/feed/" }
 ];
 
@@ -49,6 +52,30 @@ const CATEGORIES = [
   { name: "AI Startups", keywords: ["startup", "funding", "seed", "series", "venture", "founder", "unicorn", "01.ai", "baichuan"] },
   { name: "AI Hardware", keywords: ["chip", "gpu", "h100", "tpu", "semiconductor", "hardware", "infrastructure", "server", "ascend", "kunlun"] }
 ];
+
+async function getOgImage(url: string): Promise<string | null> {
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 3000); // 3s timeout
+    const res = await fetch(url, { signal: controller.signal });
+    clearTimeout(timeoutId);
+    const html = await res.text();
+    const match = html.match(/<meta[^>]+property="og:image"[^>]+content="([^">]+)"/i) ||
+                  html.match(/<meta[^>]+content="([^">]+)"[^>]+property="og:image"/i);
+    return match ? match[1] : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+async function testConnection() {
+  try {
+    await getDoc(doc(db, 'test', 'connection'));
+    console.log("Firebase connection successful");
+  } catch (error) {
+    console.error("Firebase connection test failed:", error);
+  }
+}
 
 function classify(title: string, content: string): string {
   const text = (title + " " + content).toLowerCase();
@@ -66,7 +93,6 @@ async function fetchNews() {
   oneMonthAgo.setMonth(oneMonthAgo.getMonth() - 1);
 
   let totalFetched = 0;
-  const newsCollection = collection(db, "news");
 
   for (const feed of FEEDS) {
     try {
@@ -122,7 +148,7 @@ async function fetchNews() {
 
         // 5. Deep fetch if still no image (only for new items)
         if (!imageUrl && link) {
-          const docRef = doc(newsCollection, docId);
+          const docRef = doc(db, "news", docId);
           const docSnap = await getDoc(docRef);
           const existingData = docSnap.data();
           if (!existingData || !existingData.imageUrl || existingData.imageUrl.includes("picsum.photos")) {
@@ -143,25 +169,30 @@ async function fetchNews() {
           imageUrl = `https://images.weserv.nl/?url=${encodeURIComponent(imageUrl)}&w=800&h=450&fit=cover`;
         }
 
-        await setDoc(doc(newsCollection, docId), {
-          id, title, link, pubDate: pubDate.toISOString(), content, source, category, summary, imageUrl
+        await setDoc(doc(db, "news", docId), {
+          id, title, link, pubDate: pubDate.toISOString(), content, source, category, summary, imageUrl,
+          serverKey: process.env.SERVER_KEY || "default_secret"
         }, { merge: true });
         
         feedCount++;
       }
       totalFetched += feedCount;
-      console.log(`Saved ${feedCount} new/updated items from ${feed.name}`);
+      console.log(`[SUCCESS] ${feed.name}: Processed ${feedCount} items`);
     } catch (err) {
-      console.error(`Error fetching ${feed.name}:`, err);
+      console.error(`[ERROR] ${feed.name} failed:`, err);
     }
   }
   
   // Cleanup news older than 1 month
-  const oldNewsQuery = query(newsCollection, where("pubDate", "<", oneMonthAgo.toISOString()));
-  const oldNewsSnapshot = await getDocs(oldNewsQuery);
-  const batch = writeBatch(db);
-  oldNewsSnapshot.forEach(doc => batch.delete(doc.ref));
-  await batch.commit();
+  try {
+    const q = query(collection(db, "news"), where("pubDate", "<", oneMonthAgo.toISOString()));
+    const oldNewsSnapshot = await getDocs(q);
+    const batch = writeBatch(db);
+    oldNewsSnapshot.forEach(d => batch.delete(d.ref));
+    await batch.commit();
+  } catch (e) {
+    console.error("Cleanup failed:", e);
+  }
   
   console.log(`[${new Date().toISOString()}] News fetch complete. Total items processed: ${totalFetched}`);
   
@@ -179,8 +210,8 @@ app.get("/api/health", async (req, res) => {
   const distExists = fs.existsSync(path.join(__dirname, "dist"));
   let newsCount = 0;
   try {
-    const snapshot = await getCountFromServer(collection(db, "news"));
-    newsCount = snapshot.data().count;
+    const snapshot = await getDocs(query(collection(db, "news")));
+    newsCount = snapshot.size;
   } catch (e) {}
   
   res.json({ 
@@ -193,6 +224,20 @@ app.get("/api/health", async (req, res) => {
 });
 
 // API Endpoints
+app.get("/api/debug-news", async (req, res) => {
+  try {
+    const q = query(collection(db, "news"), limit(10));
+    const snapshot = await getDocs(q);
+    const items = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
+    res.json({
+      count: items.length,
+      sample: items
+    });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
 app.get("/api/news", async (req, res) => {
   const { category, search, limit: limitVal = 50 } = req.query;
   const oneMonthAgo = new Date();
@@ -234,6 +279,8 @@ app.get("/api/categories", (req, res) => {
 
 async function startServer() {
   console.log("Starting server...");
+  
+  await testConnection();
   
   // Initial fetch
   fetchNews().catch(err => console.error("Initial fetch failed:", err));

@@ -1,4 +1,5 @@
-import React, { useState, useEffect, useCallback, useMemo } from "react";
+import * as React from "react";
+import { useState, useEffect, useCallback, useMemo, Component } from "react";
 import { Search, RefreshCw, ExternalLink, ChevronLeft, ChevronRight, Clock, Newspaper, Globe, Languages } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { formatDistanceToNow } from "date-fns";
@@ -9,7 +10,7 @@ import { GoogleGenAI } from "@google/genai";
 import { io } from "socket.io-client";
 import { initializeApp } from "firebase/app";
 import { getFirestore, collection, query, where, orderBy, limit, onSnapshot, getDocs } from "firebase/firestore";
-import { getAuth, onAuthStateChanged, signInAnonymously } from "firebase/auth";
+import { getAuth, onAuthStateChanged, GoogleAuthProvider, signInWithPopup, signOut, User } from "firebase/auth";
 import firebaseConfig from "../firebase-applet-config.json";
 
 // Initialize Firebase
@@ -69,48 +70,6 @@ function handleFirestoreError(error: unknown, operationType: OperationType, path
   throw new Error(JSON.stringify(errInfo));
 }
 
-// Error Boundary Component
-class ErrorBoundary extends React.Component<{ children: React.ReactNode }, { hasError: boolean, error: any }> {
-  constructor(props: { children: React.ReactNode }) {
-    super(props);
-    this.state = { hasError: false, error: null };
-  }
-
-  static getDerivedStateFromError(error: any) {
-    return { hasError: true, error };
-  }
-
-  render() {
-    if (this.state.hasError) {
-      return (
-        <div className="min-h-screen flex items-center justify-center bg-slate-50 p-4">
-          <div className="max-w-md w-full bg-white rounded-2xl shadow-xl p-8 text-center space-y-4">
-            <div className="w-16 h-16 bg-red-100 text-red-600 rounded-full flex items-center justify-center mx-auto">
-              <RefreshCw className="w-8 h-8" />
-            </div>
-            <h2 className="text-2xl font-bold text-slate-900">Something went wrong</h2>
-            <p className="text-slate-500 text-sm">
-              We encountered an error while loading the application. Please try refreshing the page.
-            </p>
-            <button
-              onClick={() => window.location.reload()}
-              className="w-full py-3 bg-blue-600 text-white rounded-xl font-bold hover:bg-blue-700 transition-colors"
-            >
-              Refresh Page
-            </button>
-            {process.env.NODE_ENV !== 'production' && (
-              <pre className="mt-4 p-4 bg-slate-100 rounded text-left text-xs overflow-auto max-h-40">
-                {this.state.error?.message}
-              </pre>
-            )}
-          </div>
-        </div>
-      );
-    }
-    return this.props.children;
-  }
-}
-
 // Utility for tailwind classes
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -167,15 +126,11 @@ const TRANSLATIONS = {
   }
 };
 
-export default function AppWrapper() {
-  return (
-    <ErrorBoundary>
-      <App />
-    </ErrorBoundary>
-  );
+export default function App() {
+  return <AppContent />;
 }
 
-function App() {
+function AppContent() {
   const [news, setNews] = useState<NewsItem[]>([]);
   const [categories, setCategories] = useState<string[]>([]);
   const [selectedCategory, setSelectedCategory] = useState("All");
@@ -185,23 +140,36 @@ function App() {
   const [lang, setLang] = useState<Language>("en");
   const [translating, setTranslating] = useState(false);
   const [now, setNow] = useState(new Date());
-  const [isAuthReady, setIsAuthReady] = useState(false);
+  const [user, setUser] = useState<User | null>(null);
 
   const t = TRANSLATIONS[lang];
 
   // Auth initialization
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, (user) => {
-      if (!user) {
-        signInAnonymously(auth).catch(console.error);
-      }
-      setIsAuthReady(true);
+      setUser(user);
     });
     return () => unsubscribe();
   }, []);
 
+  const handleLogin = async () => {
+    try {
+      const provider = new GoogleAuthProvider();
+      await signInWithPopup(auth, provider);
+    } catch (err) {
+      console.error("Login error:", err);
+    }
+  };
+
+  const handleLogout = async () => {
+    try {
+      await signOut(auth);
+    } catch (err) {
+      console.error("Logout error:", err);
+    }
+  };
+
   const fetchNews = useCallback(async () => {
-    if (!isAuthReady) return;
     setLoading(true);
     try {
       const oneMonthAgo = new Date();
@@ -235,7 +203,11 @@ function App() {
     } finally {
       setLoading(false);
     }
-  }, [selectedCategory, searchQuery, isAuthReady]);
+  }, [selectedCategory, searchQuery]);
+
+  useEffect(() => {
+    fetchNews();
+  }, [fetchNews]);
 
   useEffect(() => {
     fetch("/api/categories")
@@ -245,8 +217,6 @@ function App() {
 
   // Real-time updates via Firestore onSnapshot
   useEffect(() => {
-    if (!isAuthReady) return;
-
     const oneMonthAgo = new Date();
     oneMonthAgo.setMonth(oneMonthAgo.getMonth() - 1);
 
@@ -279,7 +249,7 @@ function App() {
     });
 
     return () => unsubscribe();
-  }, [selectedCategory, searchQuery, isAuthReady]);
+  }, [selectedCategory, searchQuery]);
 
   // Translation Logic
   useEffect(() => {
@@ -370,6 +340,24 @@ function App() {
           </div>
 
           <div className="flex items-center gap-2">
+            {user ? (
+              <div className="flex items-center gap-2">
+                <img src={user.photoURL || ""} alt="" className="w-8 h-8 rounded-full border border-slate-200" />
+                <button
+                  onClick={handleLogout}
+                  className="text-xs font-medium text-slate-500 hover:text-red-600 transition-colors"
+                >
+                  {lang === 'en' ? 'Logout' : '退出'}
+                </button>
+              </div>
+            ) : (
+              <button
+                onClick={handleLogin}
+                className="px-4 py-1.5 rounded-full bg-blue-600 text-white text-sm font-bold hover:bg-blue-700 transition-all shadow-lg shadow-blue-500/20"
+              >
+                {lang === 'en' ? 'Login' : '登录'}
+              </button>
+            )}
             <button
               onClick={() => setLang(lang === "en" ? "zh" : "en")}
               className="flex items-center gap-1 px-3 py-1.5 rounded-full bg-slate-100 hover:bg-slate-200 transition-colors text-sm font-medium text-slate-600"
