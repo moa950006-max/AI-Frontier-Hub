@@ -87,8 +87,12 @@ function classify(title: string, content: string): string {
   return "General AI";
 }
 
+let lastFetchTime = 0;
+const FETCH_INTERVAL = 60 * 60 * 1000; // 1 hour
+
 async function fetchNews() {
   console.log(`[${new Date().toISOString()}] Fetching news...`);
+  lastFetchTime = Date.now();
   const oneMonthAgo = new Date();
   oneMonthAgo.setMonth(oneMonthAgo.getMonth() - 1);
 
@@ -243,6 +247,12 @@ app.get("/api/news", async (req, res) => {
   const oneMonthAgo = new Date();
   oneMonthAgo.setMonth(oneMonthAgo.getMonth() - 1);
 
+  // Lazy background fetch if stale
+  if (Date.now() - lastFetchTime > FETCH_INTERVAL) {
+    console.log("News is stale, triggering background fetch...");
+    fetchNews().catch(err => console.error("Background fetch failed:", err));
+  }
+
   try {
     let q = query(
       collection(db, "news"),
@@ -277,6 +287,17 @@ app.get("/api/categories", (req, res) => {
   res.json(["All", ...CATEGORIES.map(c => c.name)]);
 });
 
+app.post("/api/fetch-now", async (req, res) => {
+  try {
+    console.log("Manual fetch triggered via API");
+    await fetchNews();
+    res.json({ status: "success" });
+  } catch (err) {
+    console.error("Manual fetch failed:", err);
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
 async function startServer() {
   console.log("Starting server...");
   
@@ -285,10 +306,10 @@ async function startServer() {
   // Initial fetch
   fetchNews().catch(err => console.error("Initial fetch failed:", err));
   
-  // Schedule periodic fetch
+  // Schedule periodic fetch (every hour)
   setInterval(() => {
     fetchNews().catch(err => console.error("Periodic fetch failed:", err));
-  }, 10 * 60 * 1000);
+  }, 60 * 60 * 1000);
 
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({

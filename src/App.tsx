@@ -141,6 +141,9 @@ function AppContent() {
   const [translating, setTranslating] = useState(false);
   const [now, setNow] = useState(new Date());
   const [user, setUser] = useState<User | null>(null);
+  const [socketConnected, setSocketConnected] = useState(false);
+  const [lastUpdate, setLastUpdate] = useState<string | null>(null);
+  const [showUpdateToast, setShowUpdateToast] = useState(false);
 
   const t = TRANSLATIONS[lang];
 
@@ -151,6 +154,37 @@ function AppContent() {
     });
     return () => unsubscribe();
   }, []);
+
+  // Socket.io for real-time notifications
+  useEffect(() => {
+    const socket = io();
+    
+    socket.on("connect", () => setSocketConnected(true));
+    socket.on("disconnect", () => setSocketConnected(false));
+    
+    socket.on("news-updated", (data) => {
+      console.log("Real-time news update received:", data);
+      setLastUpdate(new Date().toLocaleTimeString());
+      setShowUpdateToast(true);
+      setTimeout(() => setShowUpdateToast(false), 5000);
+    });
+
+    return () => {
+      socket.disconnect();
+    };
+  }, []);
+
+  const triggerManualFetch = async () => {
+    setLoading(true);
+    try {
+      const res = await fetch("/api/fetch-now", { method: "POST" });
+      if (!res.ok) throw new Error("Fetch failed");
+    } catch (err) {
+      console.error("Manual fetch error:", err);
+    } finally {
+      setLoading(false);
+    }
+  };
 
   const handleLogin = async () => {
     try {
@@ -366,15 +400,33 @@ function AppContent() {
               {lang === "en" ? "EN" : "中文"}
             </button>
             <button 
-              onClick={fetchNews}
-              className="p-2 hover:bg-slate-100 rounded-full transition-colors text-slate-500 hover:text-blue-600"
+              onClick={triggerManualFetch}
+              className="p-2 hover:bg-slate-100 rounded-full transition-colors text-slate-500 hover:text-blue-600 relative"
               title={t.refresh}
             >
               <RefreshCw className={cn("w-5 h-5", loading && "animate-spin")} />
+              {socketConnected && (
+                <span className="absolute top-0 right-0 w-2 h-2 bg-green-500 rounded-full border-2 border-white animate-pulse" />
+              )}
             </button>
           </div>
         </div>
       </header>
+
+      {/* Real-time Update Toast */}
+      <AnimatePresence>
+        {showUpdateToast && (
+          <motion.div
+            initial={{ opacity: 0, y: -50, x: "-50%" }}
+            animate={{ opacity: 1, y: 20, x: "-50%" }}
+            exit={{ opacity: 0, y: -50, x: "-50%" }}
+            className="fixed top-20 left-1/2 z-[100] bg-blue-600 text-white px-6 py-3 rounded-full shadow-2xl flex items-center gap-3 font-bold"
+          >
+            <RefreshCw className="w-4 h-4 animate-spin" />
+            {lang === 'en' ? 'New news items fetched!' : '发现新资讯，已自动更新！'}
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       <main className="max-w-7xl mx-auto px-4 py-8 space-y-12">
         {/* Hero Carousel */}
