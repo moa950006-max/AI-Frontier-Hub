@@ -132,7 +132,7 @@ export default function App() {
 
 function AppContent() {
   const [news, setNews] = useState<NewsItem[]>([]);
-  const [categories, setCategories] = useState<string[]>([]);
+  const [categories, setCategories] = useState<string[]>(["All", "AI Research", "AI Industry", "AI Tools", "AI Policy", "AI Startups", "AI Hardware"]);
   const [selectedCategory, setSelectedCategory] = useState("All");
   const [searchQuery, setSearchQuery] = useState("");
   const [loading, setLoading] = useState(true);
@@ -245,8 +245,18 @@ function AppContent() {
 
   useEffect(() => {
     fetch("/api/categories")
-      .then(res => res.json())
-      .then(setCategories);
+      .then(res => {
+        if (!res.ok) throw new Error("Failed to fetch categories");
+        return res.json();
+      })
+      .then(data => {
+        if (Array.isArray(data) && data.length > 0) {
+          setCategories(data);
+        }
+      })
+      .catch(err => {
+        console.error("Error loading categories, using fallback:", err);
+      });
   }, []);
 
   // Real-time updates via Firestore onSnapshot
