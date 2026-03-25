@@ -243,22 +243,6 @@ function AppContent() {
     fetchNews();
   }, [fetchNews]);
 
-  useEffect(() => {
-    fetch("/api/categories")
-      .then(res => {
-        if (!res.ok) throw new Error("Failed to fetch categories");
-        return res.json();
-      })
-      .then(data => {
-        if (Array.isArray(data) && data.length > 0) {
-          setCategories(data);
-        }
-      })
-      .catch(err => {
-        console.error("Error loading categories, using fallback:", err);
-      });
-  }, []);
-
   // Real-time updates via Firestore onSnapshot
   useEffect(() => {
     const oneMonthAgo = new Date();
