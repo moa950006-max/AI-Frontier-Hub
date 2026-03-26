@@ -51,6 +51,8 @@ const db = getFirestore(firebaseApp, firebaseConfig.firestoreDatabaseId);
 const newsCollection = collection(db, "news");
 
 const app = express();
+export default app; // Export for Vercel
+
 const httpServer = createServer(app);
 const io = new Server(httpServer, {
   cors: {
@@ -231,11 +233,13 @@ async function fetchNews(): Promise<any[]> {
             if (imgMatch) imageUrl = imgMatch[1];
           }
 
+          /* 
           // OG Image scraping is slow, only do it if we're not in a hurry or if it's the first few items
           if (!imageUrl && link && feedItems.length < 3) {
             const ogImage = await getOgImage(link);
             if (ogImage) imageUrl = ogImage;
           }
+          */
           
           if (!imageUrl || imageUrl.includes("feedburner")) {
             imageUrl = `https://picsum.photos/seed/${encodeURIComponent(id)}/800/450`;
@@ -254,18 +258,29 @@ async function fetchNews(): Promise<any[]> {
 
           // Only write to Firestore if not in quota lockout
           if (Date.now() > quotaExceededUntil) {
-            batch.set(doc(db, "news", docId), newsItem, { merge: true });
-            batchCount++;
-            if (batchCount >= 50) {
-              await batch.commit();
-              batch = writeBatch(db);
-              batchCount = 0;
+            try {
+              batch.set(doc(db, "news", docId), newsItem, { merge: true });
+              batchCount++;
+              if (batchCount >= 50) {
+                await batch.commit();
+                batch = writeBatch(db);
+                batchCount = 0;
+              }
+            } catch (writeErr) {
+              console.warn("Firestore write failed (likely quota):", writeErr);
+              if (writeErr instanceof Error && writeErr.message.includes("Quota exceeded")) {
+                quotaExceededUntil = Date.now() + (30 * 60 * 1000); // 30 min lockout
+              }
             }
           }
         }
 
-        if (batchCount > 0) {
-          await batch.commit();
+        try {
+          if (batchCount > 0) {
+            await batch.commit();
+          }
+        } catch (commitErr) {
+          console.warn("Firestore batch commit failed:", commitErr);
         }
         return feedItems;
       } catch (err) {
@@ -555,4 +570,12 @@ async function startServer() {
   });
 }
 
-startServer();
+// Only start the server if we're not running as a Vercel serverless function
+// Vercel will import the 'app' and handle the listening
+if (!process.env.VERCEL) {
+  startServer();
+} else {
+  // On Vercel, we still want to load the cache and test connection
+  loadCacheFromFile();
+  testConnection().catch(console.error);
+}
