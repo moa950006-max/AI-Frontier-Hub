@@ -9,15 +9,13 @@ import { twMerge } from "tailwind-merge";
 import { GoogleGenAI } from "@google/genai";
 import { io } from "socket.io-client";
 import { initializeApp } from "firebase/app";
-import { initializeFirestore, collection, query, where, orderBy, limit, onSnapshot, getDocs, getFirestore } from "firebase/firestore";
+import { getFirestore, collection, query, where, orderBy, limit, onSnapshot, getDocs } from "firebase/firestore";
 import { getAuth, onAuthStateChanged, GoogleAuthProvider, signInWithPopup, signOut, User } from "firebase/auth";
 import firebaseConfig from "../firebase-applet-config.json";
 
 // Initialize Firebase
 const app = initializeApp(firebaseConfig);
-const db = initializeFirestore(app, {
-  experimentalForceLongPolling: true,
-}, firebaseConfig.firestoreDatabaseId);
+const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
 const auth = getAuth(app);
 
 // Firestore Error Handling
@@ -108,9 +106,7 @@ const TRANSLATIONS = {
     contact: "Contact",
     ago: "ago",
     via: "via",
-    all: "All",
-    fetching: "Fetching...",
-    fetchNow: "Fetch Latest News Now"
+    all: "All"
   },
   zh: {
     title: "AI 前沿动态",
@@ -126,20 +122,85 @@ const TRANSLATIONS = {
     contact: "联系我们",
     ago: "前",
     via: "来源",
-    all: "全部",
-    fetching: "正在获取...",
-    fetchNow: "立即获取最新新闻"
+    all: "全部"
   }
 };
 
+interface ErrorBoundaryProps {
+  children: React.ReactNode;
+}
+
+interface ErrorBoundaryState {
+  hasError: boolean;
+  error: any;
+}
+
+class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundaryState> {
+  public state: ErrorBoundaryState;
+  public props: ErrorBoundaryProps;
+
+  constructor(props: ErrorBoundaryProps) {
+    super(props);
+    this.state = {
+      hasError: false,
+      error: null
+    };
+  }
+
+  static getDerivedStateFromError(error: any): ErrorBoundaryState {
+    return { hasError: true, error };
+  }
+
+  componentDidCatch(error: any, errorInfo: any) {
+    console.error("ErrorBoundary caught an error", error, errorInfo);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      let errorMessage = "Something went wrong.";
+      if (this.state.error && this.state.error.message) {
+        try {
+          const parsed = JSON.parse(this.state.error.message);
+          errorMessage = parsed.error || errorMessage;
+        } catch (e) {
+          errorMessage = this.state.error.message || errorMessage;
+        }
+      }
+
+      return (
+        <div className="min-h-screen flex items-center justify-center bg-slate-50 p-4">
+          <div className="max-w-md w-full bg-white rounded-2xl shadow-xl p-8 text-center space-y-6 border border-slate-200">
+            <div className="w-16 h-16 bg-red-100 rounded-full flex items-center justify-center mx-auto">
+              <Newspaper className="w-8 h-8 text-red-600" />
+            </div>
+            <h1 className="text-2xl font-bold text-slate-900">Application Error</h1>
+            <p className="text-slate-600">{errorMessage}</p>
+            <button 
+              onClick={() => window.location.reload()}
+              className="w-full py-3 bg-blue-600 text-white rounded-xl font-bold hover:bg-blue-700 transition-colors shadow-lg shadow-blue-500/20"
+            >
+              Reload Application
+            </button>
+          </div>
+        </div>
+      );
+    }
+
+    return this.props.children;
+  }
+}
+
 export default function App() {
-  return <AppContent />;
+  return (
+    <ErrorBoundary>
+      <AppContent />
+    </ErrorBoundary>
+  );
 }
 
 function AppContent() {
   const [news, setNews] = useState<NewsItem[]>([]);
-  const [rawNews, setRawNews] = useState<NewsItem[]>([]);
-  const [categories, setCategories] = useState<string[]>(["All", "AI Research", "AI Industry", "AI Tools", "AI Policy", "AI Startups", "AI Hardware"]);
+  const [categories, setCategories] = useState<string[]>([]);
   const [selectedCategory, setSelectedCategory] = useState("All");
   const [searchQuery, setSearchQuery] = useState("");
   const [loading, setLoading] = useState(true);
@@ -162,33 +223,18 @@ function AppContent() {
     return () => unsubscribe();
   }, []);
 
-  // Socket.io for real-time notifications
-  useEffect(() => {
-    const socket = io();
-    
-    socket.on("connect", () => setSocketConnected(true));
-    socket.on("disconnect", () => setSocketConnected(false));
-    
-    socket.on("news-updated", (data) => {
-      console.log("Real-time news update received:", data);
-      setLastUpdate(new Date().toLocaleTimeString());
-      setShowUpdateToast(true);
-      fetchNewsFromApi(); // Refresh news from API when update received
-      setTimeout(() => setShowUpdateToast(false), 5000);
-    });
-
-    return () => {
-      socket.disconnect();
-    };
-  }, []);
-
   const triggerManualFetch = async () => {
+    if (loading) return;
     setLoading(true);
     try {
       const res = await fetch("/api/fetch-now", { method: "POST" });
       if (!res.ok) throw new Error("Fetch failed");
+      // The server will emit a socket event when done, 
+      // which will trigger fetchNews(true) via the socket listener.
     } catch (err) {
       console.error("Manual fetch error:", err);
+      // Fallback: just refresh from current Firestore/cache if manual trigger fails
+      await fetchNews();
     } finally {
       setLoading(false);
     }
@@ -211,140 +257,114 @@ function AppContent() {
     }
   };
 
-  // Fetch news from our API (which has SQLite fallback)
-  const fetchNewsFromApi = useCallback(async () => {
-    setLoading(true);
-    try {
-      const url = new URL("/api/news", window.location.origin);
-      url.searchParams.append("category", selectedCategory);
-      url.searchParams.append("limit", "50");
-      if (searchQuery) url.searchParams.append("search", searchQuery);
+  useEffect(() => {
+    fetch("/api/categories")
+      .then(res => res.json())
+      .then(setCategories);
+  }, []);
 
-      const res = await fetch(url.toString());
-      if (!res.ok) throw new Error("API fetch failed");
+  // Fetch news from API with local storage caching
+  const fetchNews = useCallback(async (isSilent = false) => {
+    if (!isSilent) setLoading(true);
+    try {
+      const url = `/api/news?category=${encodeURIComponent(selectedCategory)}&limit=60`;
+      const res = await fetch(url);
+      if (!res.ok) throw new Error("Failed to fetch news from API");
+      
       const data = await res.json();
-      setNews(data);
-      setRawNews(data);
+      if (Array.isArray(data)) {
+        setNews(data);
+        // Cache in local storage
+        localStorage.setItem(`news_cache_${selectedCategory}`, JSON.stringify({
+          data,
+          timestamp: Date.now()
+        }));
+      }
     } catch (err) {
-      console.error("Error fetching news from API:", err);
+      console.error("Fetch news error:", err);
+      // Try to load from cache if API fails (e.g. quota exceeded)
+      const cached = localStorage.getItem(`news_cache_${selectedCategory}`);
+      if (cached) {
+        try {
+          const { data } = JSON.parse(cached);
+          setNews(data);
+        } catch (e) {}
+      }
     } finally {
       setLoading(false);
     }
-  }, [selectedCategory, searchQuery]);
-
-  useEffect(() => {
-    fetchNewsFromApi();
-  }, [fetchNewsFromApi]);
-
-  // Removed redundant fetchNews to save quota - relying on onSnapshot
-  /*
-  const fetchNews = useCallback(async () => {
-    ...
-  }, [selectedCategory, searchQuery]);
-
-  useEffect(() => {
-    fetchNews();
-  }, [fetchNews]);
-  */
-
-  useEffect(() => {
-    fetch("/api/categories")
-      .then(res => {
-        if (!res.ok) throw new Error("Failed to fetch categories");
-        return res.json();
-      })
-      .then(data => {
-        if (Array.isArray(data) && data.length > 0) {
-          setCategories(data);
-        }
-      })
-      .catch(err => {
-        console.error("Error loading categories, using fallback:", err);
-      });
-  }, []);
-
-  // Real-time updates via Firestore onSnapshot - optimized to skip searchQuery dependency
-  useEffect(() => {
-    setLoading(true);
-    const oneMonthAgo = new Date();
-    oneMonthAgo.setMonth(oneMonthAgo.getMonth() - 1);
-
-    let q = query(
-      collection(db, "news"),
-      where("pubDate", ">=", oneMonthAgo.toISOString()),
-      orderBy("pubDate", "desc"),
-      limit(50)
-    );
-
-    if (selectedCategory !== "All") {
-      q = query(q, where("category", "==", selectedCategory));
-    }
-
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      const data = snapshot.docs.map(doc => doc.data() as NewsItem);
-      console.log(`[Firestore] Received ${data.length} items.`);
-      if (data.length > 0) {
-        setRawNews(data);
-      } else {
-        // If Firestore is empty, try to fallback to API immediately
-        fetchNewsFromApi();
-      }
-      setLoading(false);
-    }, (err) => {
-      setLoading(false);
-      if (err.message.includes("Quota exceeded")) {
-        console.warn("Firestore quota exceeded. Using API/SQLite fallback.");
-        fetchNewsFromApi(); // Explicit fallback on error
-      } else if (err.message.includes("CANCELLED")) {
-        console.warn("Firestore connection cancelled (idle). Retrying API fetch...");
-        fetchNewsFromApi();
-      } else {
-        console.error("Firestore onSnapshot error:", err);
-      }
-    });
-
-    return () => unsubscribe();
   }, [selectedCategory]);
 
-  // Local filtering for search to avoid re-querying Firestore
-  const filteredNews = useMemo(() => {
-    if (!searchQuery) return rawNews;
-    const s = searchQuery.toLowerCase();
-    return rawNews.filter(item => 
-      item.title.toLowerCase().includes(s) || 
-      item.summary.toLowerCase().includes(s)
-    );
-  }, [rawNews, searchQuery]);
-
-  // Update news state when filteredNews changes
+  // Socket.io for real-time notifications
   useEffect(() => {
-    setNews(filteredNews);
-  }, [filteredNews]);
+    const socket = io();
+    
+    socket.on("connect", () => setSocketConnected(true));
+    socket.on("disconnect", () => setSocketConnected(false));
+    
+    socket.on("news-updated", (data) => {
+      console.log("Real-time news update received:", data);
+      setLastUpdate(new Date().toLocaleTimeString());
+      setShowUpdateToast(true);
+      setTimeout(() => setShowUpdateToast(false), 5000);
+      fetchNews(true); // Silent update when new news is available
+    });
 
-  // Translation Logic
+    return () => {
+      socket.disconnect();
+    };
+  }, [fetchNews]);
+
+  // Initial fetch and polling
   useEffect(() => {
-    if (lang === "zh" && news.length > 0 && !translating) {
-      const untranslated = news.filter(n => !n.translatedTitle);
-      if (untranslated.length > 0) {
-        translateBatch(untranslated.slice(0, 10)); // Translate in small batches
-      }
+    // Load from cache immediately for better UX
+    const cached = localStorage.getItem(`news_cache_${selectedCategory}`);
+    if (cached) {
+      try {
+        const { data } = JSON.parse(cached);
+        setNews(data);
+        setLoading(false);
+      } catch (e) {}
     }
-  }, [lang, news]);
 
-  const translateBatch = async (items: NewsItem[]) => {
+    fetchNews();
+
+    // Poll every 15 minutes (increased from 5 to save quota)
+    const interval = setInterval(() => fetchNews(true), 15 * 60 * 1000);
+    return () => clearInterval(interval);
+  }, [selectedCategory, fetchNews]);
+
+  // In-memory filtering for search
+  const filteredNews = useMemo(() => {
+    if (!searchQuery) return news;
+    const s = searchQuery.toLowerCase();
+    return news.filter(item => 
+      item.title.toLowerCase().includes(s) || 
+      item.summary.toLowerCase().includes(s) ||
+      item.content.toLowerCase().includes(s)
+    );
+  }, [news, searchQuery]);
+
+  const translateBatch = useCallback(async (items: NewsItem[]) => {
     setTranslating(true);
     try {
-      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
+      const apiKey = (window as any).process?.env?.GEMINI_API_KEY || "";
+      if (!apiKey) {
+        console.warn("Gemini API key not found for translation");
+        return;
+      }
+
+      const ai = new GoogleGenAI({ apiKey });
       const prompt = `Translate the following AI news items into Chinese. Return ONLY a JSON array of objects with 'id', 'title', and 'summary' fields.
       Items: ${JSON.stringify(items.map(i => ({ id: i.id, title: i.title, summary: i.summary })))}`;
       
       const response = await ai.models.generateContent({
         model: "gemini-3-flash-preview",
-        contents: prompt,
+        contents: [{ parts: [{ text: prompt }] }],
         config: { responseMimeType: "application/json" }
       });
 
-      const translatedData = JSON.parse(response.text);
+      const translatedData = JSON.parse(response.text || "[]");
       setNews(prev => prev.map(item => {
         const found = translatedData.find((t: any) => t.id === item.id);
         if (found) {
@@ -357,7 +377,17 @@ function AppContent() {
     } finally {
       setTranslating(false);
     }
-  };
+  }, []);
+
+  // Translation Logic
+  useEffect(() => {
+    if (lang === "zh" && news.length > 0 && !translating) {
+      const untranslated = news.filter(n => !n.translatedTitle);
+      if (untranslated.length > 0) {
+        translateBatch(untranslated.slice(0, 10)); // Translate in small batches
+      }
+    }
+  }, [lang, news, translating, translateBatch]);
 
   // Update 'now' every minute to refresh 'time ago' labels
   useEffect(() => {
@@ -365,7 +395,7 @@ function AppContent() {
     return () => clearInterval(interval);
   }, []);
 
-  const carouselNews = news.slice(0, 5);
+  const carouselNews = filteredNews.slice(0, 5);
 
   const handleNext = useCallback(() => {
     if (carouselNews.length === 0) return;
@@ -592,8 +622,8 @@ function AppContent() {
             Array.from({ length: 9 }).map((_, i) => (
               <div key={i} className="h-80 bg-white rounded-2xl animate-pulse border border-slate-200 shadow-sm" />
             ))
-          ) : news.length > 0 ? (
-            news.map((item, idx) => (
+          ) : filteredNews.length > 0 ? (
+            filteredNews.map((item, idx) => (
               <motion.article
                 key={item.id}
                 initial={{ opacity: 0, y: 20 }}
@@ -658,18 +688,6 @@ function AppContent() {
                 className="text-blue-600 hover:underline font-medium"
               >
                 {t.clearFilters}
-              </button>
-              <button 
-                onClick={triggerManualFetch}
-                disabled={loading}
-                className="mt-4 px-6 py-2 bg-blue-600 text-white rounded-lg font-medium hover:bg-blue-700 transition-colors disabled:opacity-50 flex items-center gap-2 mx-auto"
-              >
-                {loading ? (
-                  <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
-                ) : (
-                  <RefreshCw className="w-4 h-4" />
-                )}
-                <span>{loading ? t.fetching : t.fetchNow}</span>
               </button>
             </div>
           )}

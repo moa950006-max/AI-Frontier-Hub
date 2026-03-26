@@ -1,53 +1,28 @@
 import express from "express";
 import { createServer as createViteServer } from "vite";
 import { initializeApp } from "firebase/app";
-import { getFirestore, collection, doc, setDoc, getDoc, query, where, orderBy, limit, getDocs, count, writeBatch, getCountFromServer } from "firebase/firestore";
+import { 
+  getFirestore, 
+  collection, 
+  doc, 
+  setDoc, 
+  getDoc, 
+  query, 
+  where, 
+  orderBy, 
+  limit, 
+  getDocs, 
+  writeBatch,
+  getCountFromServer,
+  count
+} from "firebase/firestore";
 import Parser from "rss-parser";
 import path from "path";
 import { fileURLToPath } from "url";
 import fs from "fs";
 import { createServer } from "http";
 import { Server } from "socket.io";
-import Database from "better-sqlite3";
-
-// Initialize SQLite for local caching
-const sqlite = new Database("news_cache.db");
-sqlite.exec(`
-  CREATE TABLE IF NOT EXISTS news (
-    id TEXT PRIMARY KEY,
-    docId TEXT,
-    title TEXT,
-    link TEXT,
-    pubDate TEXT,
-    content TEXT,
-    source TEXT,
-    category TEXT,
-    summary TEXT,
-    imageUrl TEXT,
-    serverKey TEXT
-  )
-`);
-
-const insertNews = sqlite.prepare(`
-  INSERT OR REPLACE INTO news (id, docId, title, link, pubDate, content, source, category, summary, imageUrl, serverKey)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-`);
-
-const getCachedNews = sqlite.prepare(`
-  SELECT * FROM news 
-  WHERE pubDate >= ? 
-  ORDER BY pubDate DESC 
-  LIMIT ?
-`);
-
-const getCachedNewsByCategory = sqlite.prepare(`
-  SELECT * FROM news 
-  WHERE pubDate >= ? AND category = ?
-  ORDER BY pubDate DESC 
-  LIMIT ?
-`);
-
-const countCachedNews = sqlite.prepare(`SELECT count(*) as count FROM news`);
+import { GoogleGenAI } from "@google/genai";
 
 // Import the Firebase configuration
 import firebaseConfig from "./firebase-applet-config.json" assert { type: "json" };
@@ -108,39 +83,12 @@ async function getOgImage(url: string): Promise<string | null> {
   }
 }
 
-let isQuotaExceeded = false;
-let lastQuotaErrorTime = 0;
-const QUOTA_RETRY_DELAY = 60 * 60 * 1000; // 1 hour
-
-function handleQuotaError(e: any, context: string) {
-  if (e instanceof Error && e.message.includes("Quota exceeded")) {
-    isQuotaExceeded = true;
-    lastQuotaErrorTime = Date.now();
-    console.warn(`[QUOTA] Firestore quota exceeded during ${context}. Falling back to local cache.`);
-    return true;
-  }
-  return false;
-}
-
-function shouldTryFirestore() {
-  if (isQuotaExceeded && Date.now() - lastQuotaErrorTime < QUOTA_RETRY_DELAY) {
-    return false;
-  }
-  if (isQuotaExceeded) {
-    isQuotaExceeded = false; // Reset after delay
-  }
-  return true;
-}
-
 async function testConnection() {
-  if (!shouldTryFirestore()) return;
   try {
     await getDoc(doc(db, 'test', 'connection'));
     console.log("Firebase connection successful");
   } catch (error) {
-    if (!handleQuotaError(error, "connection test")) {
-      console.error("Firebase connection test failed:", error);
-    }
+    console.error("Firebase connection test failed:", error);
   }
 }
 
@@ -155,65 +103,83 @@ function classify(title: string, content: string): string {
 }
 
 let lastFetchTime = 0;
-const FETCH_INTERVAL = 4 * 60 * 60 * 1000; // 4 hours (increased from 1 to save quota)
+let quotaExceededUntil = 0;
+let cachedNews: any[] = [];
+let lastCacheTime = 0;
+const FETCH_INTERVAL = 4 * 60 * 60 * 1000; // 4 hours
+const CACHE_TTL = 60 * 60 * 1000; // 1 hour memory cache
+const CACHE_FILE = path.join(__dirname, "news_cache.json");
 
-async function fetchNews() {
-  console.log(`[${new Date().toISOString()}] Fetching news...`);
-  lastFetchTime = Date.now();
-  const oneMonthAgo = new Date();
-  oneMonthAgo.setMonth(oneMonthAgo.getMonth() - 1);
+// Helper to save cache to file
+function saveCacheToFile(data: any[]) {
+  try {
+    fs.writeFileSync(CACHE_FILE, JSON.stringify({
+      timestamp: Date.now(),
+      data
+    }));
+  } catch (e) {
+    console.error("Failed to save cache to file:", e);
+  }
+}
 
-  // Fetch existing IDs to avoid redundant writes and reads
-  let existingIds = new Set<string>();
-  if (shouldTryFirestore()) {
-    try {
-      const q = query(collection(db, "news"), orderBy("pubDate", "desc"), limit(300));
-      const snapshot = await getDocs(q);
-      existingIds = new Set(snapshot.docs.map(d => d.id));
-      console.log(`Found ${existingIds.size} existing items in Firestore to skip.`);
-    } catch (e) {
-      if (!handleQuotaError(e, "fetching existing IDs")) {
-        console.error("Failed to fetch existing IDs:", e);
-      }
+// Helper to load cache from file
+function loadCacheFromFile(): any[] {
+  try {
+    if (fs.existsSync(CACHE_FILE)) {
+      const content = fs.readFileSync(CACHE_FILE, "utf-8");
+      const { data, timestamp } = JSON.parse(content);
+      // Even if old, it's better than nothing when quota is hit
+      lastCacheTime = timestamp;
+      return data;
     }
-  } else {
-    console.log("[QUOTA] Skipping Firestore ID fetch due to active quota limit.");
+  } catch (e) {
+    console.error("Failed to load cache from file:", e);
+  }
+  return [];
+}
+
+async function fetchNews(): Promise<any[]> {
+  if (Date.now() < quotaExceededUntil) {
+    console.warn("Skipping fetch: Firestore quota recently exceeded. Waiting for reset.");
+    return [];
   }
 
-  let totalFetched = 0;
+  try {
+    console.log(`[${new Date().toISOString()}] Fetching news from RSS feeds...`);
+    lastFetchTime = Date.now();
+    const oneMonthAgo = new Date();
+    oneMonthAgo.setMonth(oneMonthAgo.getMonth() - 1);
 
-  for (const feed of FEEDS) {
-    try {
-      console.log(`[Fetch] Fetching ${feed.name} from ${feed.url}...`);
-      
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 15000); // 15s timeout per feed
-      
+    const allFetchedItems: any[] = [];
+
+    for (const feed of FEEDS) {
       try {
-        const response = await fetch(feed.url, { signal: controller.signal });
-        clearTimeout(timeoutId);
+        console.log(`Fetching ${feed.name} from ${feed.url}`);
         
-        if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
-        const xml = await response.text();
-        const data = await parser.parseString(xml);
+        // Add timeout to feed fetch (10 seconds)
+        const fetchPromise = parser.parseURL(feed.url);
+        const timeoutPromise = new Promise((_, reject) => 
+          setTimeout(() => reject(new Error(`Timeout fetching ${feed.name}`)), 10000)
+        );
         
-        console.log(`[Fetch] Received ${data.items?.length || 0} items from ${feed.name}`);
-        if (!data.items) continue;
+        const data = await Promise.race([fetchPromise, timeoutPromise]) as any;
         
         let feedCount = 0;
+        const batch = writeBatch(db);
+        let batchCount = 0;
+
         for (const item of data.items) {
-        try {
           const pubDateStr = item.pubDate || new Date().toISOString();
-          const pubDate = new Date(pubDateStr);
+          let pubDate = new Date(pubDateStr);
+          if (isNaN(pubDate.getTime())) {
+            pubDate = new Date();
+          }
           
-          // Skip news older than 1 month
           if (pubDate < oneMonthAgo) continue;
 
           const id = item.guid || item.link || item.title;
+          if (!id) continue;
           const docId = Buffer.from(id).toString('base64').replace(/\//g, '_').replace(/\+/g, '-');
-
-          // Skip if already in Firestore (if we have the list)
-          if (existingIds.has(docId)) continue;
 
           const title = item.title || "No Title";
           const link = item.link || "";
@@ -222,10 +188,7 @@ async function fetchNews() {
           const category = classify(title, content);
           const summary = content.substring(0, 200) + "...";
           
-          // Extract image URL with better logic
           let imageUrl = "";
-          
-          // 1. Check media:content
           if (item.mediaContent && Array.isArray(item.mediaContent)) {
             const media = item.mediaContent.find((m: any) => m.$ && m.$.url);
             if (media) imageUrl = media.$.url;
@@ -233,98 +196,99 @@ async function fetchNews() {
             imageUrl = (item.mediaContent as any).$.url;
           }
           
-          // 2. Check media:thumbnail
           if (!imageUrl && item.mediaThumbnail && item.mediaThumbnail.$) {
             imageUrl = item.mediaThumbnail.$.url;
           }
 
-          // 3. Check enclosure
           if (!imageUrl && item.enclosure && item.enclosure.url) {
             imageUrl = item.enclosure.url;
           }
 
-          // 4. Check content for <img> tags
           if (!imageUrl) {
             const searchIn = (item.content || "") + (item.contentEncoded || "");
             const imgMatch = searchIn.match(/<img[^>]+src="([^">]+)"/i);
             if (imgMatch) imageUrl = imgMatch[1];
           }
 
-          // 5. Deep fetch if still no image
           if (!imageUrl && link) {
             const ogImage = await getOgImage(link);
             if (ogImage) imageUrl = ogImage;
           }
           
-          // 6. Fallback
           if (!imageUrl || imageUrl.includes("feedburner")) {
             imageUrl = `https://picsum.photos/seed/${encodeURIComponent(id)}/800/450`;
           }
 
-          // Use images.weserv.nl to proxy and resize images
           if (imageUrl && !imageUrl.includes("picsum.photos") && !imageUrl.includes("weserv.nl")) {
             imageUrl = `https://images.weserv.nl/?url=${encodeURIComponent(imageUrl)}&w=800&h=450&fit=cover`;
           }
 
-          // Save to SQLite cache FIRST - this is our reliable fallback
-          try {
-            insertNews.run(
-              id, docId, title, link, pubDate.toISOString(), content, source, category, summary, imageUrl, 
-              process.env.SERVER_KEY || "default_secret"
-            );
-          } catch (e) {
-            console.error("Failed to cache news in SQLite:", e);
-          }
+          const newsItem = {
+            id, title, link, pubDate: pubDate.toISOString(), content, source, category, summary, imageUrl,
+            serverKey: process.env.SERVER_KEY || "default_secret"
+          };
 
-          // Try to save to Firestore, but don't let it block the loop if it fails (e.g. quota)
-          if (shouldTryFirestore()) {
-            try {
-              await setDoc(doc(db, "news", docId), {
-                id, title, link, pubDate: pubDate.toISOString(), content, source, category, summary, imageUrl,
-                serverKey: process.env.SERVER_KEY || "default_secret"
-              }, { merge: true });
-            } catch (e) {
-              if (!handleQuotaError(e, `setDoc for ${docId}`)) {
-                console.error(`Firestore setDoc failed for ${docId}:`, e);
-              }
-            }
-          }
+          allFetchedItems.push(newsItem);
+
+          batch.set(doc(db, "news", docId), newsItem, { merge: true });
           
+          batchCount++;
           feedCount++;
-        } catch (itemErr) {
-          console.error(`Error processing item in ${feed.name}:`, itemErr);
+
+          if (batchCount >= 50) {
+            await batch.commit();
+            batchCount = 0;
+          }
         }
+
+        if (batchCount > 0) {
+          await batch.commit();
         }
-        totalFetched += feedCount;
-        console.log(`[SUCCESS] ${feed.name}: Processed ${feedCount} items`);
-      } catch (fetchErr) {
-        clearTimeout(timeoutId);
-        console.error(`[ERROR] Failed to fetch or parse ${feed.name}:`, fetchErr);
+
+      } catch (err) {
+        if (err instanceof Error && err.message.includes("Quota exceeded")) {
+          console.error(`[QUOTA EXCEEDED] ${feed.name} failed. Stopping fetch.`);
+          quotaExceededUntil = Date.now() + (60 * 60 * 1000);
+          break;
+        }
+        console.error(`[ERROR] ${feed.name} failed:`, err);
       }
-    } catch (err) {
-      console.error(`[ERROR] ${feed.name} loop failed:`, err);
     }
-  }
-  
-  // Cleanup news older than 1 month
-  if (shouldTryFirestore()) {
+    
+    // Cleanup news older than 1 month
     try {
-      const q = query(collection(db, "news"), where("pubDate", "<", oneMonthAgo.toISOString()));
+      const q = query(
+        collection(db, "news"), 
+        where("pubDate", "<", oneMonthAgo.toISOString()),
+        limit(20)
+      );
       const oldNewsSnapshot = await getDocs(q);
-      const batch = writeBatch(db);
-      oldNewsSnapshot.forEach(d => batch.delete(d.ref));
-      await batch.commit();
-    } catch (e) {
-      if (!handleQuotaError(e, "cleanup")) {
-        console.error("Cleanup failed:", e);
+      
+      if (!oldNewsSnapshot.empty) {
+        const batch = writeBatch(db);
+        oldNewsSnapshot.forEach(d => batch.delete(d.ref));
+        await batch.commit();
       }
+    } catch (e) {}
+    
+    if (allFetchedItems.length > 0) {
+      // Sort by date desc
+      allFetchedItems.sort((a, b) => new Date(b.pubDate).getTime() - new Date(a.pubDate).getTime());
+      
+      io.emit("news-updated", { count: allFetchedItems.length, timestamp: new Date().toISOString() });
+      
+      // Update memory and file cache immediately
+      cachedNews = allFetchedItems;
+      lastCacheTime = Date.now();
+      saveCacheToFile(allFetchedItems);
     }
-  }
-  
-  console.log(`[${new Date().toISOString()}] News fetch complete. Total items processed: ${totalFetched}`);
-  
-  if (totalFetched > 0) {
-    io.emit("news-updated", { count: totalFetched, timestamp: new Date().toISOString() });
+    return allFetchedItems;
+  } catch (err) {
+    console.error("Global fetchNews error:", err);
+    if (err instanceof Error && err.message.includes("Quota exceeded")) {
+      quotaExceededUntil = Date.now() + (60 * 60 * 1000);
+    }
+    return [];
   }
 }
 
@@ -332,35 +296,33 @@ async function fetchNews() {
 
 app.use(express.json());
 
-  // Health Check
-  app.get("/api/health", async (req, res) => {
-    const distExists = fs.existsSync(path.join(__dirname, "dist"));
-    let newsCount = 0;
-    
-    if (shouldTryFirestore()) {
-      try {
-        const coll = collection(db, "news");
-        const snapshot = await getCountFromServer(coll);
-        newsCount = snapshot.data().count;
-      } catch (e) {
-        if (!handleQuotaError(e, "health check count")) {
-          console.error("Health check Firestore news count failed, using SQLite count:", e);
-        }
-        const row = countCachedNews.get() as { count: number };
-        newsCount = row.count;
-      }
-    } else {
-      const row = countCachedNews.get() as { count: number };
-      newsCount = row.count;
-    }
+// Health Check
+app.get("/api/health", async (req, res) => {
+  const distExists = fs.existsSync(path.join(__dirname, "dist"));
+  let newsCount = 0;
+  try {
+    const countSnapshot = await getCountFromServer(collection(db, "news"));
+    newsCount = countSnapshot.data().count;
+  } catch (e) {}
   
   res.json({ 
     status: "ok", 
     dbConnected: !!db,
     newsCount,
     distExists,
+    lastFetch: lastFetchTime ? new Date(lastFetchTime).toISOString() : "never",
+    quotaExceededUntil: quotaExceededUntil > Date.now() ? new Date(quotaExceededUntil).toISOString() : "no",
     nodeEnv: process.env.NODE_ENV
   });
+});
+
+app.post("/api/fetch-news", async (req, res) => {
+  try {
+    await fetchNews();
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
 });
 
 // API Endpoints
@@ -379,68 +341,115 @@ app.get("/api/debug-news", async (req, res) => {
 });
 
 app.get("/api/news", async (req, res) => {
-  const { category, search, limit: limitVal = 50 } = req.query;
-  console.log(`[API] GET /api/news - category: ${category}, search: ${search}, limit: ${limitVal}`);
-  const oneMonthAgo = new Date();
-  oneMonthAgo.setMonth(oneMonthAgo.getMonth() - 1);
+  const { category, search, limit: limitVal = 60 } = req.query;
 
   // Lazy background fetch if stale
-  if (Date.now() - lastFetchTime > FETCH_INTERVAL) {
+  if (Date.now() - lastFetchTime > FETCH_INTERVAL && Date.now() > quotaExceededUntil) {
     console.log("News is stale, triggering background fetch...");
     fetchNews().catch(err => console.error("Background fetch failed:", err));
   }
 
-  try {
-    if (!shouldTryFirestore()) throw new Error("Quota exceeded");
+  // 1. Use memory cache if available and fresh
+  if (cachedNews.length > 0 && (Date.now() - lastCacheTime < CACHE_TTL)) {
+    let filtered = [...cachedNews];
+    if (category && category !== "All") {
+      filtered = filtered.filter(n => n.category === category);
+    }
+    if (search) {
+      const s = String(search).toLowerCase();
+      filtered = filtered.filter(n => n.title.toLowerCase().includes(s) || n.summary.toLowerCase().includes(s));
+    }
+    return res.json(filtered.slice(0, Number(limitVal)));
+  }
 
+  // 2. If memory cache is stale or empty, try loading from file cache first (very cheap)
+  if (cachedNews.length === 0) {
+    const fileCache = loadCacheFromFile();
+    if (fileCache.length > 0) {
+      console.log("Loaded news from file cache");
+      cachedNews = fileCache;
+      // If file cache is still fresh enough, return it
+      if (Date.now() - lastCacheTime < CACHE_TTL) {
+        let filtered = [...cachedNews];
+        if (category && category !== "All") {
+          filtered = filtered.filter(n => n.category === category);
+        }
+        return res.json(filtered.slice(0, Number(limitVal)));
+      }
+    }
+  }
+
+  // 3. If we hit quota or Firestore fails, try a direct RSS fetch if cache is empty
+  if (Date.now() < quotaExceededUntil || cachedNews.length === 0) {
+    if (cachedNews.length === 0) {
+      console.log("Cache is empty and Firestore is likely down, attempting direct RSS fetch...");
+      const directItems = await fetchNews();
+      if (directItems.length > 0) {
+        let filtered = [...directItems];
+        if (category && category !== "All") {
+          filtered = filtered.filter(n => n.category === category);
+        }
+        return res.json(filtered.slice(0, Number(limitVal)));
+      }
+    } else {
+      console.log("Returning stale cache due to quota limit");
+      let filtered = [...cachedNews];
+      if (category && category !== "All") {
+        filtered = filtered.filter(n => n.category === category);
+      }
+      return res.json(filtered.slice(0, Number(limitVal)));
+    }
+  }
+
+  // 4. Finally, try fetching from Firestore if we're not in quota lockout
+  try {
+    console.log("Fetching news from Firestore...");
     let q = query(
       collection(db, "news"),
-      where("pubDate", ">=", oneMonthAgo.toISOString()),
       orderBy("pubDate", "desc"),
-      limit(Number(limitVal))
+      limit(100)
     );
 
-    if (category && category !== "All") {
-      q = query(q, where("category", "==", category));
-    }
-
     const snapshot = await getDocs(q);
-    let rows = snapshot.docs.map(doc => doc.data());
+    const allItems = snapshot.docs.map(doc => doc.data());
+    
+    // Update memory and file cache
+    cachedNews = allItems;
+    lastCacheTime = Date.now();
+    saveCacheToFile(allItems);
+
+    let rows = [...allItems];
+    if (category && category !== "All") {
+      rows = rows.filter((row: any) => row.category === category);
+    }
     
     if (search) {
       const s = String(search).toLowerCase();
       rows = rows.filter((row: any) => 
         row.title.toLowerCase().includes(s) || 
-        row.content.toLowerCase().includes(s)
+        row.summary.toLowerCase().includes(s)
       );
     }
     
-    res.json(rows);
+    res.json(rows.slice(0, Number(limitVal)));
   } catch (err) {
-    if (!handleQuotaError(err, "API news fetch")) {
-      console.error("Error fetching news from Firestore, falling back to SQLite:", err);
+    console.error("Error fetching news from Firestore:", err);
+    if (err instanceof Error && err.message.includes("Quota exceeded")) {
+      quotaExceededUntil = Date.now() + (60 * 60 * 1000);
     }
-    try {
-      const oneMonthAgoStr = oneMonthAgo.toISOString();
-      let rows: any[] = [];
-      if (category && category !== "All") {
-        rows = getCachedNewsByCategory.all(oneMonthAgoStr, category, Number(limitVal));
-      } else {
-        rows = getCachedNews.all(oneMonthAgoStr, Number(limitVal));
+    
+    // Final fallback: try direct RSS fetch if Firestore fails and we have no cache
+    if (cachedNews.length === 0) {
+      console.log("Firestore failed and cache is empty, final attempt: direct RSS fetch...");
+      const directItems = await fetchNews();
+      if (directItems.length > 0) {
+        return res.json(directItems.slice(0, Number(limitVal)));
       }
-
-      if (search) {
-        const s = String(search).toLowerCase();
-        rows = rows.filter((row: any) => 
-          row.title.toLowerCase().includes(s) || 
-          row.content.toLowerCase().includes(s)
-        );
-      }
-      res.json(rows);
-    } catch (sqliteErr) {
-      console.error("SQLite fallback failed:", sqliteErr);
-      res.status(500).json({ error: "Failed to fetch news" });
+    } else {
+      return res.json(cachedNews.slice(0, Number(limitVal)));
     }
+    
+    res.status(500).json({ error: "Failed to fetch news" });
   }
 });
 
@@ -448,43 +457,59 @@ app.get("/api/categories", (req, res) => {
   res.json(["All", ...CATEGORIES.map(c => c.name)]);
 });
 
-app.post("/api/fetch-now", async (req, res) => {
-  try {
-    console.log("Manual fetch triggered via API");
-    await fetchNews();
-    res.json({ status: "success" });
-  } catch (err) {
-    console.error("Manual fetch failed:", err);
-    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
-  }
+// Consolidate fetch endpoints
+app.post("/api/fetch-now", (req, res) => {
+  console.log("Manual fetch triggered via API (async)");
+  // Return immediately to avoid browser timeout
+  res.status(202).json({ status: "accepted", message: "Fetch started in background" });
+  
+  // Run fetch in background
+  fetchNews().catch(err => {
+    console.error("Background manual fetch failed:", err);
+  });
 });
 
 async function startServer() {
   console.log("Starting server...");
   
+  // Load cache from file immediately
+  const fileCache = loadCacheFromFile();
+  if (fileCache.length > 0) {
+    cachedNews = fileCache;
+    console.log(`Loaded ${cachedNews.length} items from file cache.`);
+  }
+
   await testConnection();
   
-  // Check if we have news before initial fetch
+  // Initial fetch if needed
   try {
-    const row = countCachedNews.get() as { count: number };
-    const newsCount = row.count;
-    if (newsCount === 0) {
-      console.log("No news found in SQLite, triggering initial fetch...");
-      fetchNews().catch(err => console.error("Initial fetch failed:", err));
+    // If we have cache, we don't even need to check count immediately
+    if (cachedNews.length === 0) {
+      const countSnapshot = await getCountFromServer(collection(db, "news"));
+      const newsCount = countSnapshot.data().count;
+      
+      if (newsCount === 0) {
+        console.log("No news found, performing initial fetch...");
+        fetchNews().catch(err => console.error("Initial fetch failed:", err));
+      } else {
+        console.log(`Found ${newsCount} existing news items. Skipping initial fetch.`);
+        lastFetchTime = Date.now();
+      }
     } else {
-      console.log(`Found ${newsCount} news items in SQLite. Skipping initial fetch.`);
+      console.log("Using file cache, skipping initial Firestore count check.");
       lastFetchTime = Date.now();
-      // Still try to fetch if it's been a while, but don't block
     }
   } catch (e) {
-    console.error("Initial news count check failed:", e);
-    fetchNews().catch(err => console.error("Initial fetch failed:", err));
+    console.error("Failed to check existing news count, attempting initial fetch anyway:", e);
+    if (cachedNews.length === 0) {
+      fetchNews().catch(err => console.error("Initial fetch failed:", err));
+    }
   }
   
   // Schedule periodic fetch (every 4 hours)
   setInterval(() => {
     fetchNews().catch(err => console.error("Periodic fetch failed:", err));
-  }, FETCH_INTERVAL);
+  }, 4 * 60 * 60 * 1000);
 
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
@@ -495,11 +520,14 @@ async function startServer() {
   } else {
     const distPath = path.join(__dirname, "dist");
     console.log(`Serving static files from ${distPath}`);
-    app.use(express.static(distPath));
-    app.get("*", (req, res) => {
-      const indexPath = path.join(distPath, "index.html");
-      res.sendFile(indexPath);
-    });
+    if (fs.existsSync(distPath)) {
+      app.use(express.static(distPath));
+      app.get("*", (req, res) => {
+        res.sendFile(path.join(distPath, "index.html"));
+      });
+    } else {
+      console.warn("Dist folder not found! Frontend might not be built.");
+    }
   }
 
   httpServer.listen(PORT, "0.0.0.0", () => {
