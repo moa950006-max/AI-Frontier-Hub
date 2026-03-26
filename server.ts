@@ -25,7 +25,21 @@ import { Server } from "socket.io";
 import { GoogleGenAI } from "@google/genai";
 
 // Import the Firebase configuration
-import firebaseConfig from "./firebase-applet-config.json" assert { type: "json" };
+let firebaseConfig;
+try {
+  const configPath = path.join(process.cwd(), "firebase-applet-config.json");
+  if (fs.existsSync(configPath)) {
+    firebaseConfig = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+  } else if (process.env.FIREBASE_CONFIG) {
+    firebaseConfig = JSON.parse(process.env.FIREBASE_CONFIG);
+  } else {
+    console.warn("Firebase configuration not found! Using placeholders.");
+    firebaseConfig = { projectId: "placeholder" };
+  }
+} catch (e) {
+  console.error("Error loading Firebase config:", e);
+  firebaseConfig = { projectId: "placeholder" };
+}
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -47,6 +61,10 @@ const io = new Server(httpServer, {
 
 const PORT = 3000;
 const parser = new Parser();
+
+// Use /tmp for cache in read-only environments like Vercel
+const CACHE_FILE = process.env.VERCEL ? path.join("/tmp", "news_cache.json") : path.join(process.cwd(), "news_cache.json");
+
 const FEEDS = [
   { name: "TechCrunch AI", url: "https://techcrunch.com/category/artificial-intelligence/feed/" },
   { name: "VentureBeat AI", url: "https://venturebeat.com/category/ai/feed/" },
@@ -108,7 +126,6 @@ let cachedNews: any[] = [];
 let lastCacheTime = 0;
 const FETCH_INTERVAL = 4 * 60 * 60 * 1000; // 4 hours
 const CACHE_TTL = 60 * 60 * 1000; // 1 hour memory cache
-const CACHE_FILE = path.join(__dirname, "news_cache.json");
 
 // Helper to save cache to file
 function saveCacheToFile(data: any[]) {
@@ -145,30 +162,34 @@ async function fetchNews(): Promise<any[]> {
   }
 
   try {
-    console.log(`[${new Date().toISOString()}] Fetching news from RSS feeds...`);
+    console.log(`[${new Date().toISOString()}] Fetching news from RSS feeds (parallel)...`);
     lastFetchTime = Date.now();
     const oneMonthAgo = new Date();
     oneMonthAgo.setMonth(oneMonthAgo.getMonth() - 1);
 
     const allFetchedItems: any[] = [];
 
-    for (const feed of FEEDS) {
+    // Fetch all feeds in parallel to speed up
+    const feedPromises = FEEDS.map(async (feed) => {
       try {
         console.log(`Fetching ${feed.name} from ${feed.url}`);
         
-        // Add timeout to feed fetch (10 seconds)
+        // Add timeout to feed fetch (8 seconds)
         const fetchPromise = parser.parseURL(feed.url);
         const timeoutPromise = new Promise((_, reject) => 
-          setTimeout(() => reject(new Error(`Timeout fetching ${feed.name}`)), 10000)
+          setTimeout(() => reject(new Error(`Timeout fetching ${feed.name}`)), 8000)
         );
         
         const data = await Promise.race([fetchPromise, timeoutPromise]) as any;
         
-        let feedCount = 0;
+        const feedItems: any[] = [];
         let batch = writeBatch(db);
         let batchCount = 0;
 
-        for (const item of data.items) {
+        // Only process top 15 items per feed to avoid timeout on serverless
+        const itemsToProcess = data.items.slice(0, 15);
+
+        for (const item of itemsToProcess) {
           const pubDateStr = item.pubDate || new Date().toISOString();
           let pubDate = new Date(pubDateStr);
           if (isNaN(pubDate.getTime())) {
@@ -210,7 +231,8 @@ async function fetchNews(): Promise<any[]> {
             if (imgMatch) imageUrl = imgMatch[1];
           }
 
-          if (!imageUrl && link) {
+          // OG Image scraping is slow, only do it if we're not in a hurry or if it's the first few items
+          if (!imageUrl && link && feedItems.length < 3) {
             const ogImage = await getOgImage(link);
             if (ogImage) imageUrl = ogImage;
           }
@@ -228,49 +250,50 @@ async function fetchNews(): Promise<any[]> {
             serverKey: process.env.SERVER_KEY || "default_secret"
           };
 
-          allFetchedItems.push(newsItem);
+          feedItems.push(newsItem);
 
-          batch.set(doc(db, "news", docId), newsItem, { merge: true });
-          
-          batchCount++;
-          feedCount++;
-
-          if (batchCount >= 50) {
-            await batch.commit();
-            batch = writeBatch(db); // Create a new batch after commit
-            batchCount = 0;
+          // Only write to Firestore if not in quota lockout
+          if (Date.now() > quotaExceededUntil) {
+            batch.set(doc(db, "news", docId), newsItem, { merge: true });
+            batchCount++;
+            if (batchCount >= 50) {
+              await batch.commit();
+              batch = writeBatch(db);
+              batchCount = 0;
+            }
           }
         }
 
         if (batchCount > 0) {
           await batch.commit();
         }
-
+        return feedItems;
       } catch (err) {
-        if (err instanceof Error && err.message.includes("Quota exceeded")) {
-          console.error(`[QUOTA EXCEEDED] ${feed.name} failed. Stopping fetch.`);
-          quotaExceededUntil = Date.now() + (60 * 60 * 1000);
-          break;
-        }
         console.error(`[ERROR] ${feed.name} failed:`, err);
+        return [];
       }
-    }
+    });
+
+    const results = await Promise.all(feedPromises);
+    results.forEach(items => allFetchedItems.push(...items));
     
     // Cleanup news older than 1 month
-    try {
-      const q = query(
-        collection(db, "news"), 
-        where("pubDate", "<", oneMonthAgo.toISOString()),
-        limit(20)
-      );
-      const oldNewsSnapshot = await getDocs(q);
-      
-      if (!oldNewsSnapshot.empty) {
-        const batch = writeBatch(db);
-        oldNewsSnapshot.forEach(d => batch.delete(d.ref));
-        await batch.commit();
-      }
-    } catch (e) {}
+    if (Date.now() > quotaExceededUntil) {
+      try {
+        const q = query(
+          collection(db, "news"), 
+          where("pubDate", "<", oneMonthAgo.toISOString()),
+          limit(20)
+        );
+        const oldNewsSnapshot = await getDocs(q);
+        
+        if (!oldNewsSnapshot.empty) {
+          const batch = writeBatch(db);
+          oldNewsSnapshot.forEach(d => batch.delete(d.ref));
+          await batch.commit();
+        }
+      } catch (e) {}
+    }
     
     if (allFetchedItems.length > 0) {
       // Sort by date desc
@@ -509,7 +532,7 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
-    const distPath = path.join(__dirname, "dist");
+    const distPath = path.join(process.cwd(), "dist");
     console.log(`Serving static files from ${distPath}`);
     if (fs.existsSync(distPath)) {
       app.use(express.static(distPath));
@@ -517,7 +540,13 @@ async function startServer() {
         res.sendFile(path.join(distPath, "index.html"));
       });
     } else {
-      console.warn("Dist folder not found! Frontend might not be built.");
+      console.warn("Dist folder not found at:", distPath);
+      // Fallback for Vercel where dist might be in a different place
+      const altDistPath = path.join(__dirname, "dist");
+      if (fs.existsSync(altDistPath)) {
+        app.use(express.static(altDistPath));
+        app.get("*", (req, res) => res.sendFile(path.join(altDistPath, "index.html")));
+      }
     }
   }
 
