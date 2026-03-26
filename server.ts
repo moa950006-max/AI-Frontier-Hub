@@ -1,5 +1,4 @@
 import express from "express";
-import { createServer as createViteServer } from "vite";
 import { initializeApp } from "firebase/app";
 import { 
   getFirestore, 
@@ -540,8 +539,9 @@ async function startServer() {
     fetchNews().catch(err => console.error("Periodic fetch failed:", err));
   }, 4 * 60 * 60 * 1000);
 
-  if (process.env.NODE_ENV !== "production") {
-    const vite = await createViteServer({
+  if (process.env.NODE_ENV !== "production" && !process.env.VERCEL) {
+    const { createServer: viteCreateServer } = await import("vite");
+    const vite = await viteCreateServer({
       server: { middlewareMode: true },
       appType: "spa",
     });
