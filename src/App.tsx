@@ -132,6 +132,7 @@ export default function App() {
 
 function AppContent() {
   const [news, setNews] = useState<NewsItem[]>([]);
+  const [rawNews, setRawNews] = useState<NewsItem[]>([]);
   const [categories, setCategories] = useState<string[]>(["All", "AI Research", "AI Industry", "AI Tools", "AI Policy", "AI Startups", "AI Hardware"]);
   const [selectedCategory, setSelectedCategory] = useState("All");
   const [searchQuery, setSearchQuery] = useState("");
@@ -166,6 +167,7 @@ function AppContent() {
       console.log("Real-time news update received:", data);
       setLastUpdate(new Date().toLocaleTimeString());
       setShowUpdateToast(true);
+      fetchNewsFromApi(); // Refresh news from API when update received
       setTimeout(() => setShowUpdateToast(false), 5000);
     });
 
@@ -203,48 +205,61 @@ function AppContent() {
     }
   };
 
-  const fetchNews = useCallback(async () => {
+  // Fetch news from our API (which has SQLite fallback)
+  const fetchNewsFromApi = useCallback(async () => {
     setLoading(true);
     try {
-      const oneMonthAgo = new Date();
-      oneMonthAgo.setMonth(oneMonthAgo.getMonth() - 1);
+      const url = new URL("/api/news", window.location.origin);
+      url.searchParams.append("category", selectedCategory);
+      url.searchParams.append("limit", "50");
+      if (searchQuery) url.searchParams.append("search", searchQuery);
 
-      let q = query(
-        collection(db, "news"),
-        where("pubDate", ">=", oneMonthAgo.toISOString()),
-        orderBy("pubDate", "desc"),
-        limit(50)
-      );
-
-      if (selectedCategory !== "All") {
-        q = query(q, where("category", "==", selectedCategory));
-      }
-
-      const snapshot = await getDocs(q);
-      let data = snapshot.docs.map(doc => doc.data() as NewsItem);
-
-      if (searchQuery) {
-        const s = searchQuery.toLowerCase();
-        data = data.filter(item => 
-          item.title.toLowerCase().includes(s) || 
-          item.summary.toLowerCase().includes(s)
-        );
-      }
-
+      const res = await fetch(url.toString());
+      if (!res.ok) throw new Error("API fetch failed");
+      const data = await res.json();
       setNews(data);
+      setRawNews(data);
     } catch (err) {
-      handleFirestoreError(err, OperationType.GET, "news");
+      console.error("Error fetching news from API:", err);
     } finally {
       setLoading(false);
     }
   }, [selectedCategory, searchQuery]);
 
   useEffect(() => {
+    fetchNewsFromApi();
+  }, [fetchNewsFromApi]);
+
+  // Removed redundant fetchNews to save quota - relying on onSnapshot
+  /*
+  const fetchNews = useCallback(async () => {
+    ...
+  }, [selectedCategory, searchQuery]);
+
+  useEffect(() => {
     fetchNews();
   }, [fetchNews]);
+  */
 
-  // Real-time updates via Firestore onSnapshot
   useEffect(() => {
+    fetch("/api/categories")
+      .then(res => {
+        if (!res.ok) throw new Error("Failed to fetch categories");
+        return res.json();
+      })
+      .then(data => {
+        if (Array.isArray(data) && data.length > 0) {
+          setCategories(data);
+        }
+      })
+      .catch(err => {
+        console.error("Error loading categories, using fallback:", err);
+      });
+  }, []);
+
+  // Real-time updates via Firestore onSnapshot - optimized to skip searchQuery dependency
+  useEffect(() => {
+    setLoading(true);
     const oneMonthAgo = new Date();
     oneMonthAgo.setMonth(oneMonthAgo.getMonth() - 1);
 
@@ -260,24 +275,36 @@ function AppContent() {
     }
 
     const unsubscribe = onSnapshot(q, (snapshot) => {
-      let data = snapshot.docs.map(doc => doc.data() as NewsItem);
-      
-      if (searchQuery) {
-        const s = searchQuery.toLowerCase();
-        data = data.filter(item => 
-          item.title.toLowerCase().includes(s) || 
-          item.summary.toLowerCase().includes(s)
-        );
-      }
-      
-      setNews(data);
+      const data = snapshot.docs.map(doc => doc.data() as NewsItem);
+      setRawNews(data);
       setLoading(false);
     }, (err) => {
-      handleFirestoreError(err, OperationType.GET, "news");
+      // If quota is exceeded, we still want to stop loading
+      setLoading(false);
+      if (err.message.includes("Quota exceeded")) {
+        console.warn("Firestore quota exceeded. Please wait until tomorrow.");
+      } else {
+        handleFirestoreError(err, OperationType.GET, "news");
+      }
     });
 
     return () => unsubscribe();
-  }, [selectedCategory, searchQuery]);
+  }, [selectedCategory]);
+
+  // Local filtering for search to avoid re-querying Firestore
+  const filteredNews = useMemo(() => {
+    if (!searchQuery) return rawNews;
+    const s = searchQuery.toLowerCase();
+    return rawNews.filter(item => 
+      item.title.toLowerCase().includes(s) || 
+      item.summary.toLowerCase().includes(s)
+    );
+  }, [rawNews, searchQuery]);
+
+  // Update news state when filteredNews changes
+  useEffect(() => {
+    setNews(filteredNews);
+  }, [filteredNews]);
 
   // Translation Logic
   useEffect(() => {

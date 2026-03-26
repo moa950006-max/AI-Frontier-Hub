@@ -1,13 +1,53 @@
 import express from "express";
 import { createServer as createViteServer } from "vite";
 import { initializeApp } from "firebase/app";
-import { getFirestore, collection, doc, setDoc, getDoc, query, where, orderBy, limit, getDocs, count, writeBatch } from "firebase/firestore";
+import { getFirestore, collection, doc, setDoc, getDoc, query, where, orderBy, limit, getDocs, count, writeBatch, getCountFromServer } from "firebase/firestore";
 import Parser from "rss-parser";
 import path from "path";
 import { fileURLToPath } from "url";
 import fs from "fs";
 import { createServer } from "http";
 import { Server } from "socket.io";
+import Database from "better-sqlite3";
+
+// Initialize SQLite for local caching
+const sqlite = new Database("news_cache.db");
+sqlite.exec(`
+  CREATE TABLE IF NOT EXISTS news (
+    id TEXT PRIMARY KEY,
+    docId TEXT,
+    title TEXT,
+    link TEXT,
+    pubDate TEXT,
+    content TEXT,
+    source TEXT,
+    category TEXT,
+    summary TEXT,
+    imageUrl TEXT,
+    serverKey TEXT
+  )
+`);
+
+const insertNews = sqlite.prepare(`
+  INSERT OR REPLACE INTO news (id, docId, title, link, pubDate, content, source, category, summary, imageUrl, serverKey)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+`);
+
+const getCachedNews = sqlite.prepare(`
+  SELECT * FROM news 
+  WHERE pubDate >= ? 
+  ORDER BY pubDate DESC 
+  LIMIT ?
+`);
+
+const getCachedNewsByCategory = sqlite.prepare(`
+  SELECT * FROM news 
+  WHERE pubDate >= ? AND category = ?
+  ORDER BY pubDate DESC 
+  LIMIT ?
+`);
+
+const countCachedNews = sqlite.prepare(`SELECT count(*) as count FROM news`);
 
 // Import the Firebase configuration
 import firebaseConfig from "./firebase-applet-config.json" assert { type: "json" };
@@ -88,13 +128,24 @@ function classify(title: string, content: string): string {
 }
 
 let lastFetchTime = 0;
-const FETCH_INTERVAL = 60 * 60 * 1000; // 1 hour
+const FETCH_INTERVAL = 4 * 60 * 60 * 1000; // 4 hours (increased from 1 to save quota)
 
 async function fetchNews() {
   console.log(`[${new Date().toISOString()}] Fetching news...`);
   lastFetchTime = Date.now();
   const oneMonthAgo = new Date();
   oneMonthAgo.setMonth(oneMonthAgo.getMonth() - 1);
+
+  // Fetch existing IDs to avoid redundant writes and reads
+  let existingIds = new Set<string>();
+  try {
+    const q = query(collection(db, "news"), orderBy("pubDate", "desc"), limit(300));
+    const snapshot = await getDocs(q);
+    existingIds = new Set(snapshot.docs.map(d => d.id));
+    console.log(`Found ${existingIds.size} existing items in Firestore to skip.`);
+  } catch (e) {
+    console.error("Failed to fetch existing IDs:", e);
+  }
 
   let totalFetched = 0;
 
@@ -114,6 +165,9 @@ async function fetchNews() {
 
         const id = item.guid || item.link || item.title;
         const docId = Buffer.from(id).toString('base64').replace(/\//g, '_').replace(/\+/g, '-');
+
+        // Skip if already in Firestore
+        if (existingIds.has(docId)) continue;
 
         const title = item.title || "No Title";
         const link = item.link || "";
@@ -150,17 +204,10 @@ async function fetchNews() {
           if (imgMatch) imageUrl = imgMatch[1];
         }
 
-        // 5. Deep fetch if still no image (only for new items)
+        // 5. Deep fetch if still no image
         if (!imageUrl && link) {
-          const docRef = doc(db, "news", docId);
-          const docSnap = await getDoc(docRef);
-          const existingData = docSnap.data();
-          if (!existingData || !existingData.imageUrl || existingData.imageUrl.includes("picsum.photos")) {
-             const ogImage = await getOgImage(link);
-             if (ogImage) imageUrl = ogImage;
-          } else {
-            imageUrl = existingData.imageUrl;
-          }
+          const ogImage = await getOgImage(link);
+          if (ogImage) imageUrl = ogImage;
         }
         
         // 6. Fallback
@@ -171,6 +218,16 @@ async function fetchNews() {
         // Use images.weserv.nl to proxy and resize images (helps with hotlinking and performance)
         if (imageUrl && !imageUrl.includes("picsum.photos") && !imageUrl.includes("weserv.nl")) {
           imageUrl = `https://images.weserv.nl/?url=${encodeURIComponent(imageUrl)}&w=800&h=450&fit=cover`;
+        }
+
+        // Save to SQLite cache
+        try {
+          insertNews.run(
+            id, docId, title, link, pubDate.toISOString(), content, source, category, summary, imageUrl, 
+            process.env.SERVER_KEY || "default_secret"
+          );
+        } catch (e) {
+          console.error("Failed to cache news in SQLite:", e);
         }
 
         await setDoc(doc(db, "news", docId), {
@@ -214,9 +271,14 @@ app.get("/api/health", async (req, res) => {
   const distExists = fs.existsSync(path.join(__dirname, "dist"));
   let newsCount = 0;
   try {
-    const snapshot = await getDocs(query(collection(db, "news")));
-    newsCount = snapshot.size;
-  } catch (e) {}
+    const coll = collection(db, "news");
+    const snapshot = await getCountFromServer(coll);
+    newsCount = snapshot.data().count;
+  } catch (e) {
+    console.error("Health check Firestore news count failed, using SQLite count:", e);
+    const row = countCachedNews.get() as { count: number };
+    newsCount = row.count;
+  }
   
   res.json({ 
     status: "ok", 
@@ -278,8 +340,28 @@ app.get("/api/news", async (req, res) => {
     
     res.json(rows);
   } catch (err) {
-    console.error("Error fetching news from Firestore:", err);
-    res.status(500).json({ error: "Failed to fetch news" });
+    console.error("Error fetching news from Firestore, falling back to SQLite:", err);
+    try {
+      const oneMonthAgoStr = oneMonthAgo.toISOString();
+      let rows: any[] = [];
+      if (category && category !== "All") {
+        rows = getCachedNewsByCategory.all(oneMonthAgoStr, category, Number(limitVal));
+      } else {
+        rows = getCachedNews.all(oneMonthAgoStr, Number(limitVal));
+      }
+
+      if (search) {
+        const s = String(search).toLowerCase();
+        rows = rows.filter((row: any) => 
+          row.title.toLowerCase().includes(s) || 
+          row.content.toLowerCase().includes(s)
+        );
+      }
+      res.json(rows);
+    } catch (sqliteErr) {
+      console.error("SQLite fallback failed:", sqliteErr);
+      res.status(500).json({ error: "Failed to fetch news" });
+    }
   }
 });
 
@@ -303,13 +385,27 @@ async function startServer() {
   
   await testConnection();
   
-  // Initial fetch
-  fetchNews().catch(err => console.error("Initial fetch failed:", err));
+  // Check if we have news before initial fetch
+  try {
+    const coll = collection(db, "news");
+    const snapshot = await getCountFromServer(coll);
+    const newsCount = snapshot.data().count;
+    if (newsCount === 0) {
+      console.log("No news found, triggering initial fetch...");
+      fetchNews().catch(err => console.error("Initial fetch failed:", err));
+    } else {
+      console.log(`Found ${newsCount} news items. Skipping initial fetch.`);
+      lastFetchTime = Date.now(); // Mark as fresh to avoid immediate lazy fetch
+    }
+  } catch (e) {
+    console.error("Initial news count check failed:", e);
+    fetchNews().catch(err => console.error("Initial fetch failed:", err));
+  }
   
-  // Schedule periodic fetch (every hour)
+  // Schedule periodic fetch (every 4 hours)
   setInterval(() => {
     fetchNews().catch(err => console.error("Periodic fetch failed:", err));
-  }, 60 * 60 * 1000);
+  }, FETCH_INTERVAL);
 
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
