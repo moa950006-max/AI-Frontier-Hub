@@ -184,12 +184,24 @@ async function fetchNews() {
 
   for (const feed of FEEDS) {
     try {
-      console.log(`Fetching ${feed.name} from ${feed.url}`);
-      const data = await parser.parseURL(feed.url);
-      console.log(`Received ${data.items.length} items from ${feed.name}`);
+      console.log(`[Fetch] Fetching ${feed.name} from ${feed.url}...`);
       
-      let feedCount = 0;
-      for (const item of data.items) {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 15000); // 15s timeout per feed
+      
+      try {
+        const response = await fetch(feed.url, { signal: controller.signal });
+        clearTimeout(timeoutId);
+        
+        if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+        const xml = await response.text();
+        const data = await parser.parseString(xml);
+        
+        console.log(`[Fetch] Received ${data.items?.length || 0} items from ${feed.name}`);
+        if (!data.items) continue;
+        
+        let feedCount = 0;
+        for (const item of data.items) {
         try {
           const pubDateStr = item.pubDate || new Date().toISOString();
           const pubDate = new Date(pubDateStr);
@@ -282,11 +294,15 @@ async function fetchNews() {
         } catch (itemErr) {
           console.error(`Error processing item in ${feed.name}:`, itemErr);
         }
+        }
+        totalFetched += feedCount;
+        console.log(`[SUCCESS] ${feed.name}: Processed ${feedCount} items`);
+      } catch (fetchErr) {
+        clearTimeout(timeoutId);
+        console.error(`[ERROR] Failed to fetch or parse ${feed.name}:`, fetchErr);
       }
-      totalFetched += feedCount;
-      console.log(`[SUCCESS] ${feed.name}: Processed ${feedCount} items`);
     } catch (err) {
-      console.error(`[ERROR] ${feed.name} failed:`, err);
+      console.error(`[ERROR] ${feed.name} loop failed:`, err);
     }
   }
   

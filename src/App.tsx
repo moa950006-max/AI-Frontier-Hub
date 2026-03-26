@@ -9,13 +9,15 @@ import { twMerge } from "tailwind-merge";
 import { GoogleGenAI } from "@google/genai";
 import { io } from "socket.io-client";
 import { initializeApp } from "firebase/app";
-import { getFirestore, collection, query, where, orderBy, limit, onSnapshot, getDocs } from "firebase/firestore";
+import { initializeFirestore, collection, query, where, orderBy, limit, onSnapshot, getDocs, getFirestore } from "firebase/firestore";
 import { getAuth, onAuthStateChanged, GoogleAuthProvider, signInWithPopup, signOut, User } from "firebase/auth";
 import firebaseConfig from "../firebase-applet-config.json";
 
 // Initialize Firebase
 const app = initializeApp(firebaseConfig);
-const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
+const db = initializeFirestore(app, {
+  experimentalForceLongPolling: true,
+}, firebaseConfig.firestoreDatabaseId);
 const auth = getAuth(app);
 
 // Firestore Error Handling
@@ -106,7 +108,9 @@ const TRANSLATIONS = {
     contact: "Contact",
     ago: "ago",
     via: "via",
-    all: "All"
+    all: "All",
+    fetching: "Fetching...",
+    fetchNow: "Fetch Latest News Now"
   },
   zh: {
     title: "AI 前沿动态",
@@ -122,7 +126,9 @@ const TRANSLATIONS = {
     contact: "联系我们",
     ago: "前",
     via: "来源",
-    all: "全部"
+    all: "全部",
+    fetching: "正在获取...",
+    fetchNow: "立即获取最新新闻"
   }
 };
 
@@ -276,15 +282,22 @@ function AppContent() {
 
     const unsubscribe = onSnapshot(q, (snapshot) => {
       const data = snapshot.docs.map(doc => doc.data() as NewsItem);
+      console.log(`[Firestore] Received ${data.length} items.`);
       if (data.length > 0) {
         setRawNews(data);
+      } else {
+        // If Firestore is empty, try to fallback to API immediately
+        fetchNewsFromApi();
       }
       setLoading(false);
     }, (err) => {
-      // If quota is exceeded, we still want to stop loading
       setLoading(false);
       if (err.message.includes("Quota exceeded")) {
         console.warn("Firestore quota exceeded. Using API/SQLite fallback.");
+        fetchNewsFromApi(); // Explicit fallback on error
+      } else if (err.message.includes("CANCELLED")) {
+        console.warn("Firestore connection cancelled (idle). Retrying API fetch...");
+        fetchNewsFromApi();
       } else {
         console.error("Firestore onSnapshot error:", err);
       }
@@ -645,6 +658,18 @@ function AppContent() {
                 className="text-blue-600 hover:underline font-medium"
               >
                 {t.clearFilters}
+              </button>
+              <button 
+                onClick={triggerManualFetch}
+                disabled={loading}
+                className="mt-4 px-6 py-2 bg-blue-600 text-white rounded-lg font-medium hover:bg-blue-700 transition-colors disabled:opacity-50 flex items-center gap-2 mx-auto"
+              >
+                {loading ? (
+                  <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
+                ) : (
+                  <RefreshCw className="w-4 h-4" />
+                )}
+                <span>{loading ? t.fetching : t.fetchNow}</span>
               </button>
             </div>
           )}
