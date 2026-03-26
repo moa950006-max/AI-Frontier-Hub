@@ -165,7 +165,7 @@ async function fetchNews(): Promise<any[]> {
         const data = await Promise.race([fetchPromise, timeoutPromise]) as any;
         
         let feedCount = 0;
-        const batch = writeBatch(db);
+        let batch = writeBatch(db);
         let batchCount = 0;
 
         for (const item of data.items) {
@@ -237,6 +237,7 @@ async function fetchNews(): Promise<any[]> {
 
           if (batchCount >= 50) {
             await batch.commit();
+            batch = writeBatch(db); // Create a new batch after commit
             batchCount = 0;
           }
         }
@@ -342,6 +343,23 @@ app.get("/api/debug-news", async (req, res) => {
 
 app.get("/api/news", async (req, res) => {
   const { category, search, limit: limitVal = 60 } = req.query;
+  
+  const categoryStr = category ? String(category) : "All";
+  const searchStr = search ? String(search).toLowerCase() : "";
+
+  function applyFilters(items: any[]) {
+    let filtered = [...items];
+    if (categoryStr !== "All") {
+      filtered = filtered.filter(n => n.category === categoryStr);
+    }
+    if (searchStr) {
+      filtered = filtered.filter(n => 
+        n.title.toLowerCase().includes(searchStr) || 
+        n.summary.toLowerCase().includes(searchStr)
+      );
+    }
+    return filtered.slice(0, Number(limitVal));
+  }
 
   // Lazy background fetch if stale
   if (Date.now() - lastFetchTime > FETCH_INTERVAL && Date.now() > quotaExceededUntil) {
@@ -351,18 +369,11 @@ app.get("/api/news", async (req, res) => {
 
   // 1. Use memory cache if available and fresh
   if (cachedNews.length > 0 && (Date.now() - lastCacheTime < CACHE_TTL)) {
-    let filtered = [...cachedNews];
-    if (category && category !== "All") {
-      filtered = filtered.filter(n => n.category === category);
-    }
-    if (search) {
-      const s = String(search).toLowerCase();
-      filtered = filtered.filter(n => n.title.toLowerCase().includes(s) || n.summary.toLowerCase().includes(s));
-    }
-    return res.json(filtered.slice(0, Number(limitVal)));
+    console.log("Serving from fresh memory cache");
+    return res.json(applyFilters(cachedNews));
   }
 
-  // 2. If memory cache is stale or empty, try loading from file cache first (very cheap)
+  // 2. If memory cache is stale or empty, try loading from file cache first
   if (cachedNews.length === 0) {
     const fileCache = loadCacheFromFile();
     if (fileCache.length > 0) {
@@ -370,34 +381,16 @@ app.get("/api/news", async (req, res) => {
       cachedNews = fileCache;
       // If file cache is still fresh enough, return it
       if (Date.now() - lastCacheTime < CACHE_TTL) {
-        let filtered = [...cachedNews];
-        if (category && category !== "All") {
-          filtered = filtered.filter(n => n.category === category);
-        }
-        return res.json(filtered.slice(0, Number(limitVal)));
+        return res.json(applyFilters(cachedNews));
       }
     }
   }
 
-  // 3. If we hit quota or Firestore fails, try a direct RSS fetch if cache is empty
-  if (Date.now() < quotaExceededUntil || cachedNews.length === 0) {
-    if (cachedNews.length === 0) {
-      console.log("Cache is empty and Firestore is likely down, attempting direct RSS fetch...");
-      const directItems = await fetchNews();
-      if (directItems.length > 0) {
-        let filtered = [...directItems];
-        if (category && category !== "All") {
-          filtered = filtered.filter(n => n.category === category);
-        }
-        return res.json(filtered.slice(0, Number(limitVal)));
-      }
-    } else {
-      console.log("Returning stale cache due to quota limit");
-      let filtered = [...cachedNews];
-      if (category && category !== "All") {
-        filtered = filtered.filter(n => n.category === category);
-      }
-      return res.json(filtered.slice(0, Number(limitVal)));
+  // 3. If we hit quota or Firestore fails, return whatever we have
+  if (Date.now() < quotaExceededUntil) {
+    console.log("Returning stale cache due to known quota limit");
+    if (cachedNews.length > 0) {
+      return res.json(applyFilters(cachedNews));
     }
   }
 
@@ -413,43 +406,41 @@ app.get("/api/news", async (req, res) => {
     const snapshot = await getDocs(q);
     const allItems = snapshot.docs.map(doc => doc.data());
     
-    // Update memory and file cache
-    cachedNews = allItems;
-    lastCacheTime = Date.now();
-    saveCacheToFile(allItems);
-
-    let rows = [...allItems];
-    if (category && category !== "All") {
-      rows = rows.filter((row: any) => row.category === category);
+    if (allItems.length > 0) {
+      // Update memory and file cache
+      cachedNews = allItems;
+      lastCacheTime = Date.now();
+      saveCacheToFile(allItems);
+      return res.json(applyFilters(cachedNews));
+    } else if (cachedNews.length > 0) {
+      return res.json(applyFilters(cachedNews));
     }
     
-    if (search) {
-      const s = String(search).toLowerCase();
-      rows = rows.filter((row: any) => 
-        row.title.toLowerCase().includes(s) || 
-        row.summary.toLowerCase().includes(s)
-      );
+    // If Firestore is empty, try direct fetch
+    console.log("Firestore empty, attempting direct RSS fetch...");
+    const directItems = await fetchNews();
+    if (directItems.length > 0) {
+      return res.json(applyFilters(directItems));
     }
-    
-    res.json(rows.slice(0, Number(limitVal)));
   } catch (err) {
     console.error("Error fetching news from Firestore:", err);
     if (err instanceof Error && err.message.includes("Quota exceeded")) {
       quotaExceededUntil = Date.now() + (60 * 60 * 1000);
     }
     
-    // Final fallback: try direct RSS fetch if Firestore fails and we have no cache
-    if (cachedNews.length === 0) {
-      console.log("Firestore failed and cache is empty, final attempt: direct RSS fetch...");
-      const directItems = await fetchNews();
-      if (directItems.length > 0) {
-        return res.json(directItems.slice(0, Number(limitVal)));
-      }
-    } else {
-      return res.json(cachedNews.slice(0, Number(limitVal)));
+    // Final fallback: return cache if we have it, otherwise try direct fetch
+    if (cachedNews.length > 0) {
+      console.log("Returning stale cache after Firestore error");
+      return res.json(applyFilters(cachedNews));
     }
     
-    res.status(500).json({ error: "Failed to fetch news" });
+    console.log("Firestore failed and cache is empty, final attempt: direct RSS fetch...");
+    const directItems = await fetchNews();
+    if (directItems.length > 0) {
+      return res.json(applyFilters(directItems));
+    }
+    
+    res.status(500).json({ error: "Failed to fetch news", details: err instanceof Error ? err.message : String(err) });
   }
 });
 

@@ -227,10 +227,24 @@ function AppContent() {
     if (loading) return;
     setLoading(true);
     try {
-      const res = await fetch("/api/fetch-now", { method: "POST" });
-      if (!res.ok) throw new Error("Fetch failed");
+      console.log("Triggering manual fetch...");
+      const res = await fetch("/api/fetch-now", { 
+        method: "POST",
+        headers: { "Content-Type": "application/json" }
+      });
+      
+      if (!res.ok) {
+        const errorData = await res.json().catch(() => ({}));
+        throw new Error(errorData.error || `Failed to trigger manual fetch (Status: ${res.status})`);
+      }
+      
+      const data = await res.json();
+      console.log("Manual fetch triggered successfully:", data);
+      
       // The server will emit a socket event when done, 
       // which will trigger fetchNews(true) via the socket listener.
+      // But we can also trigger a silent fetch here after a short delay to be sure
+      setTimeout(() => fetchNews(true), 2000);
     } catch (err) {
       console.error("Manual fetch error:", err);
       // Fallback: just refresh from current Firestore/cache if manual trigger fails
@@ -267,18 +281,25 @@ function AppContent() {
   const fetchNews = useCallback(async (isSilent = false) => {
     if (!isSilent) setLoading(true);
     try {
+      console.log(`Fetching news for category: ${selectedCategory}`);
       const url = `/api/news?category=${encodeURIComponent(selectedCategory)}&limit=60`;
       const res = await fetch(url);
-      if (!res.ok) throw new Error("Failed to fetch news from API");
+      if (!res.ok) {
+        const errorData = await res.json().catch(() => ({}));
+        throw new Error(errorData.error || `Failed to fetch news (Status: ${res.status})`);
+      }
       
       const data = await res.json();
       if (Array.isArray(data)) {
+        console.log(`Successfully fetched ${data.length} news items`);
         setNews(data);
         // Cache in local storage
         localStorage.setItem(`news_cache_${selectedCategory}`, JSON.stringify({
           data,
           timestamp: Date.now()
         }));
+      } else {
+        console.warn("Received non-array data from news API:", data);
       }
     } catch (err) {
       console.error("Fetch news error:", err);
@@ -287,8 +308,11 @@ function AppContent() {
       if (cached) {
         try {
           const { data } = JSON.parse(cached);
+          console.log("Using local storage cache due to fetch error");
           setNews(data);
-        } catch (e) {}
+        } catch (e) {
+          console.error("Failed to parse local storage cache:", e);
+        }
       }
     } finally {
       setLoading(false);
