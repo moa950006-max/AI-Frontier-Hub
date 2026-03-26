@@ -157,85 +157,98 @@ async function fetchNews() {
       
       let feedCount = 0;
       for (const item of data.items) {
-        const pubDateStr = item.pubDate || new Date().toISOString();
-        const pubDate = new Date(pubDateStr);
-        
-        // Skip news older than 1 month
-        if (pubDate < oneMonthAgo) continue;
-
-        const id = item.guid || item.link || item.title;
-        const docId = Buffer.from(id).toString('base64').replace(/\//g, '_').replace(/\+/g, '-');
-
-        // Skip if already in Firestore
-        if (existingIds.has(docId)) continue;
-
-        const title = item.title || "No Title";
-        const link = item.link || "";
-        const content = item.contentSnippet || item.content || "";
-        const source = feed.name;
-        const category = classify(title, content);
-        const summary = content.substring(0, 200) + "...";
-        
-        // Extract image URL with better logic
-        let imageUrl = "";
-        
-        // 1. Check media:content
-        if (item.mediaContent && Array.isArray(item.mediaContent)) {
-          const media = item.mediaContent.find((m: any) => m.$ && m.$.url);
-          if (media) imageUrl = media.$.url;
-        } else if (item.mediaContent && (item.mediaContent as any).$ && (item.mediaContent as any).$.url) {
-          imageUrl = (item.mediaContent as any).$.url;
-        }
-        
-        // 2. Check media:thumbnail
-        if (!imageUrl && item.mediaThumbnail && item.mediaThumbnail.$) {
-          imageUrl = item.mediaThumbnail.$.url;
-        }
-
-        // 3. Check enclosure
-        if (!imageUrl && item.enclosure && item.enclosure.url) {
-          imageUrl = item.enclosure.url;
-        }
-
-        // 4. Check content for <img> tags
-        if (!imageUrl) {
-          const searchIn = (item.content || "") + (item.contentEncoded || "");
-          const imgMatch = searchIn.match(/<img[^>]+src="([^">]+)"/i);
-          if (imgMatch) imageUrl = imgMatch[1];
-        }
-
-        // 5. Deep fetch if still no image
-        if (!imageUrl && link) {
-          const ogImage = await getOgImage(link);
-          if (ogImage) imageUrl = ogImage;
-        }
-        
-        // 6. Fallback
-        if (!imageUrl || imageUrl.includes("feedburner")) {
-          imageUrl = `https://picsum.photos/seed/${encodeURIComponent(id)}/800/450`;
-        }
-
-        // Use images.weserv.nl to proxy and resize images (helps with hotlinking and performance)
-        if (imageUrl && !imageUrl.includes("picsum.photos") && !imageUrl.includes("weserv.nl")) {
-          imageUrl = `https://images.weserv.nl/?url=${encodeURIComponent(imageUrl)}&w=800&h=450&fit=cover`;
-        }
-
-        // Save to SQLite cache
         try {
-          insertNews.run(
-            id, docId, title, link, pubDate.toISOString(), content, source, category, summary, imageUrl, 
-            process.env.SERVER_KEY || "default_secret"
-          );
-        } catch (e) {
-          console.error("Failed to cache news in SQLite:", e);
-        }
+          const pubDateStr = item.pubDate || new Date().toISOString();
+          const pubDate = new Date(pubDateStr);
+          
+          // Skip news older than 1 month
+          if (pubDate < oneMonthAgo) continue;
 
-        await setDoc(doc(db, "news", docId), {
-          id, title, link, pubDate: pubDate.toISOString(), content, source, category, summary, imageUrl,
-          serverKey: process.env.SERVER_KEY || "default_secret"
-        }, { merge: true });
-        
-        feedCount++;
+          const id = item.guid || item.link || item.title;
+          const docId = Buffer.from(id).toString('base64').replace(/\//g, '_').replace(/\+/g, '-');
+
+          // Skip if already in Firestore (if we have the list)
+          if (existingIds.has(docId)) continue;
+
+          const title = item.title || "No Title";
+          const link = item.link || "";
+          const content = item.contentSnippet || item.content || "";
+          const source = feed.name;
+          const category = classify(title, content);
+          const summary = content.substring(0, 200) + "...";
+          
+          // Extract image URL with better logic
+          let imageUrl = "";
+          
+          // 1. Check media:content
+          if (item.mediaContent && Array.isArray(item.mediaContent)) {
+            const media = item.mediaContent.find((m: any) => m.$ && m.$.url);
+            if (media) imageUrl = media.$.url;
+          } else if (item.mediaContent && (item.mediaContent as any).$ && (item.mediaContent as any).$.url) {
+            imageUrl = (item.mediaContent as any).$.url;
+          }
+          
+          // 2. Check media:thumbnail
+          if (!imageUrl && item.mediaThumbnail && item.mediaThumbnail.$) {
+            imageUrl = item.mediaThumbnail.$.url;
+          }
+
+          // 3. Check enclosure
+          if (!imageUrl && item.enclosure && item.enclosure.url) {
+            imageUrl = item.enclosure.url;
+          }
+
+          // 4. Check content for <img> tags
+          if (!imageUrl) {
+            const searchIn = (item.content || "") + (item.contentEncoded || "");
+            const imgMatch = searchIn.match(/<img[^>]+src="([^">]+)"/i);
+            if (imgMatch) imageUrl = imgMatch[1];
+          }
+
+          // 5. Deep fetch if still no image
+          if (!imageUrl && link) {
+            const ogImage = await getOgImage(link);
+            if (ogImage) imageUrl = ogImage;
+          }
+          
+          // 6. Fallback
+          if (!imageUrl || imageUrl.includes("feedburner")) {
+            imageUrl = `https://picsum.photos/seed/${encodeURIComponent(id)}/800/450`;
+          }
+
+          // Use images.weserv.nl to proxy and resize images
+          if (imageUrl && !imageUrl.includes("picsum.photos") && !imageUrl.includes("weserv.nl")) {
+            imageUrl = `https://images.weserv.nl/?url=${encodeURIComponent(imageUrl)}&w=800&h=450&fit=cover`;
+          }
+
+          // Save to SQLite cache FIRST - this is our reliable fallback
+          try {
+            insertNews.run(
+              id, docId, title, link, pubDate.toISOString(), content, source, category, summary, imageUrl, 
+              process.env.SERVER_KEY || "default_secret"
+            );
+          } catch (e) {
+            console.error("Failed to cache news in SQLite:", e);
+          }
+
+          // Try to save to Firestore, but don't let it block the loop if it fails (e.g. quota)
+          try {
+            await setDoc(doc(db, "news", docId), {
+              id, title, link, pubDate: pubDate.toISOString(), content, source, category, summary, imageUrl,
+              serverKey: process.env.SERVER_KEY || "default_secret"
+            }, { merge: true });
+          } catch (e) {
+            if (e instanceof Error && e.message.includes("Quota exceeded")) {
+              // Silently ignore quota errors for individual items to keep the loop moving
+            } else {
+              console.error(`Firestore setDoc failed for ${docId}:`, e);
+            }
+          }
+          
+          feedCount++;
+        } catch (itemErr) {
+          console.error(`Error processing item in ${feed.name}:`, itemErr);
+        }
       }
       totalFetched += feedCount;
       console.log(`[SUCCESS] ${feed.name}: Processed ${feedCount} items`);
@@ -306,6 +319,7 @@ app.get("/api/debug-news", async (req, res) => {
 
 app.get("/api/news", async (req, res) => {
   const { category, search, limit: limitVal = 50 } = req.query;
+  console.log(`[API] GET /api/news - category: ${category}, search: ${search}, limit: ${limitVal}`);
   const oneMonthAgo = new Date();
   oneMonthAgo.setMonth(oneMonthAgo.getMonth() - 1);
 
@@ -387,15 +401,15 @@ async function startServer() {
   
   // Check if we have news before initial fetch
   try {
-    const coll = collection(db, "news");
-    const snapshot = await getCountFromServer(coll);
-    const newsCount = snapshot.data().count;
+    const row = countCachedNews.get() as { count: number };
+    const newsCount = row.count;
     if (newsCount === 0) {
-      console.log("No news found, triggering initial fetch...");
+      console.log("No news found in SQLite, triggering initial fetch...");
       fetchNews().catch(err => console.error("Initial fetch failed:", err));
     } else {
-      console.log(`Found ${newsCount} news items. Skipping initial fetch.`);
-      lastFetchTime = Date.now(); // Mark as fresh to avoid immediate lazy fetch
+      console.log(`Found ${newsCount} news items in SQLite. Skipping initial fetch.`);
+      lastFetchTime = Date.now();
+      // Still try to fetch if it's been a while, but don't block
     }
   } catch (e) {
     console.error("Initial news count check failed:", e);

@@ -276,15 +276,17 @@ function AppContent() {
 
     const unsubscribe = onSnapshot(q, (snapshot) => {
       const data = snapshot.docs.map(doc => doc.data() as NewsItem);
-      setRawNews(data);
+      if (data.length > 0) {
+        setRawNews(data);
+      }
       setLoading(false);
     }, (err) => {
       // If quota is exceeded, we still want to stop loading
       setLoading(false);
       if (err.message.includes("Quota exceeded")) {
-        console.warn("Firestore quota exceeded. Please wait until tomorrow.");
+        console.warn("Firestore quota exceeded. Using API/SQLite fallback.");
       } else {
-        handleFirestoreError(err, OperationType.GET, "news");
+        console.error("Firestore onSnapshot error:", err);
       }
     });
 
