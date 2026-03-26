@@ -108,12 +108,39 @@ async function getOgImage(url: string): Promise<string | null> {
   }
 }
 
+let isQuotaExceeded = false;
+let lastQuotaErrorTime = 0;
+const QUOTA_RETRY_DELAY = 60 * 60 * 1000; // 1 hour
+
+function handleQuotaError(e: any, context: string) {
+  if (e instanceof Error && e.message.includes("Quota exceeded")) {
+    isQuotaExceeded = true;
+    lastQuotaErrorTime = Date.now();
+    console.warn(`[QUOTA] Firestore quota exceeded during ${context}. Falling back to local cache.`);
+    return true;
+  }
+  return false;
+}
+
+function shouldTryFirestore() {
+  if (isQuotaExceeded && Date.now() - lastQuotaErrorTime < QUOTA_RETRY_DELAY) {
+    return false;
+  }
+  if (isQuotaExceeded) {
+    isQuotaExceeded = false; // Reset after delay
+  }
+  return true;
+}
+
 async function testConnection() {
+  if (!shouldTryFirestore()) return;
   try {
     await getDoc(doc(db, 'test', 'connection'));
     console.log("Firebase connection successful");
   } catch (error) {
-    console.error("Firebase connection test failed:", error);
+    if (!handleQuotaError(error, "connection test")) {
+      console.error("Firebase connection test failed:", error);
+    }
   }
 }
 
@@ -138,13 +165,19 @@ async function fetchNews() {
 
   // Fetch existing IDs to avoid redundant writes and reads
   let existingIds = new Set<string>();
-  try {
-    const q = query(collection(db, "news"), orderBy("pubDate", "desc"), limit(300));
-    const snapshot = await getDocs(q);
-    existingIds = new Set(snapshot.docs.map(d => d.id));
-    console.log(`Found ${existingIds.size} existing items in Firestore to skip.`);
-  } catch (e) {
-    console.error("Failed to fetch existing IDs:", e);
+  if (shouldTryFirestore()) {
+    try {
+      const q = query(collection(db, "news"), orderBy("pubDate", "desc"), limit(300));
+      const snapshot = await getDocs(q);
+      existingIds = new Set(snapshot.docs.map(d => d.id));
+      console.log(`Found ${existingIds.size} existing items in Firestore to skip.`);
+    } catch (e) {
+      if (!handleQuotaError(e, "fetching existing IDs")) {
+        console.error("Failed to fetch existing IDs:", e);
+      }
+    }
+  } else {
+    console.log("[QUOTA] Skipping Firestore ID fetch due to active quota limit.");
   }
 
   let totalFetched = 0;
@@ -232,16 +265,16 @@ async function fetchNews() {
           }
 
           // Try to save to Firestore, but don't let it block the loop if it fails (e.g. quota)
-          try {
-            await setDoc(doc(db, "news", docId), {
-              id, title, link, pubDate: pubDate.toISOString(), content, source, category, summary, imageUrl,
-              serverKey: process.env.SERVER_KEY || "default_secret"
-            }, { merge: true });
-          } catch (e) {
-            if (e instanceof Error && e.message.includes("Quota exceeded")) {
-              // Silently ignore quota errors for individual items to keep the loop moving
-            } else {
-              console.error(`Firestore setDoc failed for ${docId}:`, e);
+          if (shouldTryFirestore()) {
+            try {
+              await setDoc(doc(db, "news", docId), {
+                id, title, link, pubDate: pubDate.toISOString(), content, source, category, summary, imageUrl,
+                serverKey: process.env.SERVER_KEY || "default_secret"
+              }, { merge: true });
+            } catch (e) {
+              if (!handleQuotaError(e, `setDoc for ${docId}`)) {
+                console.error(`Firestore setDoc failed for ${docId}:`, e);
+              }
             }
           }
           
@@ -258,14 +291,18 @@ async function fetchNews() {
   }
   
   // Cleanup news older than 1 month
-  try {
-    const q = query(collection(db, "news"), where("pubDate", "<", oneMonthAgo.toISOString()));
-    const oldNewsSnapshot = await getDocs(q);
-    const batch = writeBatch(db);
-    oldNewsSnapshot.forEach(d => batch.delete(d.ref));
-    await batch.commit();
-  } catch (e) {
-    console.error("Cleanup failed:", e);
+  if (shouldTryFirestore()) {
+    try {
+      const q = query(collection(db, "news"), where("pubDate", "<", oneMonthAgo.toISOString()));
+      const oldNewsSnapshot = await getDocs(q);
+      const batch = writeBatch(db);
+      oldNewsSnapshot.forEach(d => batch.delete(d.ref));
+      await batch.commit();
+    } catch (e) {
+      if (!handleQuotaError(e, "cleanup")) {
+        console.error("Cleanup failed:", e);
+      }
+    }
   }
   
   console.log(`[${new Date().toISOString()}] News fetch complete. Total items processed: ${totalFetched}`);
@@ -279,19 +316,27 @@ async function fetchNews() {
 
 app.use(express.json());
 
-// Health Check
-app.get("/api/health", async (req, res) => {
-  const distExists = fs.existsSync(path.join(__dirname, "dist"));
-  let newsCount = 0;
-  try {
-    const coll = collection(db, "news");
-    const snapshot = await getCountFromServer(coll);
-    newsCount = snapshot.data().count;
-  } catch (e) {
-    console.error("Health check Firestore news count failed, using SQLite count:", e);
-    const row = countCachedNews.get() as { count: number };
-    newsCount = row.count;
-  }
+  // Health Check
+  app.get("/api/health", async (req, res) => {
+    const distExists = fs.existsSync(path.join(__dirname, "dist"));
+    let newsCount = 0;
+    
+    if (shouldTryFirestore()) {
+      try {
+        const coll = collection(db, "news");
+        const snapshot = await getCountFromServer(coll);
+        newsCount = snapshot.data().count;
+      } catch (e) {
+        if (!handleQuotaError(e, "health check count")) {
+          console.error("Health check Firestore news count failed, using SQLite count:", e);
+        }
+        const row = countCachedNews.get() as { count: number };
+        newsCount = row.count;
+      }
+    } else {
+      const row = countCachedNews.get() as { count: number };
+      newsCount = row.count;
+    }
   
   res.json({ 
     status: "ok", 
@@ -330,6 +375,8 @@ app.get("/api/news", async (req, res) => {
   }
 
   try {
+    if (!shouldTryFirestore()) throw new Error("Quota exceeded");
+
     let q = query(
       collection(db, "news"),
       where("pubDate", ">=", oneMonthAgo.toISOString()),
@@ -354,7 +401,9 @@ app.get("/api/news", async (req, res) => {
     
     res.json(rows);
   } catch (err) {
-    console.error("Error fetching news from Firestore, falling back to SQLite:", err);
+    if (!handleQuotaError(err, "API news fetch")) {
+      console.error("Error fetching news from Firestore, falling back to SQLite:", err);
+    }
     try {
       const oneMonthAgoStr = oneMonthAgo.toISOString();
       let rows: any[] = [];
